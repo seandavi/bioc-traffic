@@ -6,12 +6,13 @@
 # Object presence is the check, not record counts: Logpush only writes an
 # object when there are events, and the Worker logs one record per request,
 # so zero objects for a whole day means the push (or the site) is dead.
-# ponytail: threshold check only; raise MIN_OBJECTS well above 24 after the
-# cutover, when hourly delivery becomes guaranteed by traffic volume.
+# ponytail: threshold check only. Post-cutover delivery is ~2600 objects/day
+# (Sept 2026); 1000 trips on a gap of roughly nine hours without false alarms
+# on a slow day.
 set -euo pipefail
 
 PREFIX=${LOGPUSH_PREFIX:-gs://bioc-u24-logs/cloudflare/bioc-access-logs}
-MIN_OBJECTS=${MIN_OBJECTS:-1}   # dev-era traffic delivers 7-24 objects/day
+MIN_OBJECTS=${MIN_OBJECTS:-1000}   # ~2600/day since the cutover
 day=$(date -u -d yesterday +%Y%m%d)   # Logpush {DATE} is UTC
 
 n=$(gcloud storage ls "$PREFIX/$day/" 2>/dev/null | grep -c '\.log\.gz$' || true)
