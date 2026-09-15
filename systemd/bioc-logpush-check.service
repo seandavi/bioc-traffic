@@ -1,0 +1,16 @@
+[Unit]
+Description=Alert if yesterday's Logpush access-log delivery to GCS is missing
+Documentation=file:///home/davsean/Documents/git/bioc-site/docs/adr/0003-request-logging-after-the-cloudflare-cutover.md
+After=network-online.target
+Wants=network-online.target
+OnFailure=bioc-notify@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/davsean/Documents/git/bioc-site
+ExecStart=/home/davsean/Documents/git/bioc-site/check-logpush.sh
+# One GCS listing; anything past a few minutes is a stuck network call.
+TimeoutStartSec=10m
+
+[Install]
+WantedBy=default.target

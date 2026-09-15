@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Logpush delivery gap check
+
+[Timer]
+# 07:15 MDT is hours past UTC midnight, so yesterday's UTC prefix is closed
+# and fully delivered (Logpush lag is minutes).
+OnCalendar=*-*-* 07:15:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
