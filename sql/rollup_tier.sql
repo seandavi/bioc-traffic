@@ -109,11 +109,19 @@ folded AS (
                 THEN '(other)' ELSE value END AS v,
            client_class, client_key, bytes
     FROM long LEFT JOIN top ON long.dimension = top.dimension AND long.value = top.top_value
+),
+-- One row per client first: a plain GROUP BY spills well, and the DISTINCT below then sees
+-- far fewer rows. Straight off folded, a 30 d hour tier took 50 min at 32 GB; this is ~6x
+-- faster, same output. (approx_count_distinct was faster still but ~10% off per hour.)
+per_client AS (
+    SELECT t, dimension, v, client_class, client_key, count(*) AS requests, sum(bytes) AS bytes
+    FROM folded
+    GROUP BY ALL
 )
 SELECT t, dimension, v AS value, client_class, client_class_rule_version() AS rule_version,
-       count(*) AS requests, CAST(sum(bytes) AS BIGINT) AS bytes,
+       CAST(sum(requests) AS BIGINT) AS requests, CAST(sum(bytes) AS BIGINT) AS bytes,
        count(DISTINCT client_key) AS clients
-FROM folded
+FROM per_client
 GROUP BY GROUPING SETS ((t, dimension, v, client_class), (t, dimension, v),
                         (dimension, v, client_class), (dimension, v))
 ORDER BY dimension, t NULLS FIRST, requests DESC;
