@@ -109,6 +109,8 @@ def connect(salt=None):
     tmp = SCRATCH / "duckdb-download-stats"
     tmp.mkdir(parents=True, exist_ok=True)
     con.execute(f"SET temp_directory = '{tmp}'")
+    # ponytail: fixed caps for a shared, busy host (other DuckDB jobs run beside this one).
+    con.execute("SET memory_limit = '40GB'; SET threads = 16")
     if salt:
         con.execute("SET VARIABLE ip_salt = ?", [salt])
     for f in SQL:
