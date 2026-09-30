@@ -11,7 +11,9 @@
 -- CloudFront rows have none, not 'unknown'), ua_family, page, referrer (host), cache
 -- (x_edge_result_type), package and bioc_version (package downloads only). page, referrer,
 -- ua_family and package keep their top_n values over the window, by requests; the rest
--- is '(other)'.
+-- is '(other)'. per_bucket := true (the hour and day tiers) keeps the top_n per t instead and
+-- drops the t NULL rows, so each t depends only on its own requests and a stored tier can be
+-- updated a few buckets at a time (rollup_merge, #19).
 --
 -- Production traffic only. Classes step at the 2026-09-28 cutover for classifier reasons:
 -- the CloudFront era has no ASN or bot label (#11 comment), so publish with rule_version.
@@ -83,7 +85,17 @@ CREATE OR REPLACE MACRO rollup_window(grain) AS CASE grain
     WHEN 'day' THEN INTERVAL 90 DAY
     ELSE error('grain must be minute, hour or day') END;
 
-CREATE OR REPLACE MACRO rollup_tier(grain, t0, t1, top_n := 25) AS TABLE
+-- How far back an incremental run recomputes: whatever upstream can have rewritten since the
+-- last run. The 15-min Parquet timer rewrites the current and previous UTC hour, so hourly runs
+-- redo 3 hours; the 08:00 UTC re-seal rewrites yesterday, so the daily run (after it) redoes
+-- yesterday and today, for the day tier and, with --since-yesterday, the hour tier. Change
+-- these with the Parquet timers.
+CREATE OR REPLACE MACRO rollup_late(grain) AS CASE grain
+    WHEN 'hour' THEN INTERVAL 2 HOUR
+    WHEN 'day' THEN INTERVAL 1 DAY
+    ELSE error('grain must be hour or day') END;
+
+CREATE OR REPLACE MACRO rollup_tier(grain, t0, t1, top_n := 25, per_bucket := false) AS TABLE
 WITH h AS (
     FROM hits
     WHERE ts >= t0 AND ts < t1
@@ -92,24 +104,25 @@ WITH h AS (
       AND year BETWEEN year(t0) AND year(t1) AND date BETWEEN CAST(t0 AS DATE) AND CAST(t1 AS DATE)
 ),
 long AS NOT MATERIALIZED (
-    UNPIVOT (SELECT ts, client_key, bytes, client_class, overall, status_class, status, country,
+    UNPIVOT (SELECT date_trunc(grain, ts) AS t, client_key, bytes, client_class, overall, status_class, status, country,
                     ua_family, page, referrer, cache, package, bioc_version FROM h)
     ON overall, status_class, status, country, ua_family, page, referrer, cache, package, bioc_version
     INTO NAME dimension VALUE value
 ),
 top AS (
-    SELECT dimension, value AS top_value
+    SELECT CASE WHEN per_bucket THEN t END AS top_t, dimension, value AS top_value
     FROM long
     WHERE dimension IN ('page', 'referrer', 'ua_family', 'package')
-    GROUP BY dimension, value
-    QUALIFY row_number() OVER (PARTITION BY dimension ORDER BY count(*) DESC, value) <= top_n
+    GROUP BY top_t, dimension, value
+    QUALIFY row_number() OVER (PARTITION BY top_t, dimension ORDER BY count(*) DESC, value) <= top_n
 ),
 folded AS (
-    SELECT date_trunc(grain, ts) AS t, long.dimension,
+    SELECT long.t, long.dimension,
            CASE WHEN long.dimension IN ('page', 'referrer', 'ua_family', 'package') AND top_value IS NULL
                 THEN '(other)' ELSE value END AS v,
            client_class, client_key, bytes
     FROM long LEFT JOIN top ON long.dimension = top.dimension AND long.value = top.top_value
+                           AND (NOT per_bucket OR long.t = top.top_t)
 ),
 -- One row per client first: a plain GROUP BY spills well, and the DISTINCT below then sees
 -- far fewer rows. Straight off folded, a 30 d hour tier took 50 min at 32 GB; this is ~6x
@@ -125,4 +138,38 @@ SELECT t, dimension, v AS value, client_class, client_class_rule_version() AS ru
 FROM per_client
 GROUP BY GROUPING SETS ((t, dimension, v, client_class), (t, dimension, v),
                         (dimension, v, client_class), (dimension, v))
+-- ponytail: per_bucket still computes the window sets, then drops them; costs only in --full.
+HAVING NOT per_bucket OR t IS NOT NULL
 ORDER BY dimension, t NULLS FIRST, requests DESC;
+
+-- A stored per_bucket tier brought up to t1: its rows in [t0, ti) kept, [ti, t1) recomputed,
+-- rows before t0 (past retention) dropped. Equals rollup_tier(grain, t0, t1, per_bucket := true)
+-- as long as nothing before ti changed upstream since the stored file was written.
+CREATE OR REPLACE MACRO rollup_merge(grain, stored, t0, ti, t1) AS TABLE
+FROM (FROM read_parquet(stored) WHERE t >= t0 AND t < ti
+      UNION ALL
+      FROM rollup_tier(grain, ti, t1, per_bucket := true))
+ORDER BY dimension, t, requests DESC;
+
+-- Exact distinct clients over the hour (30 d) and day (90 d) tier windows, overall and per
+-- client_class (NULL: all classes). The tiers no longer carry window rows, and summed per-t
+-- clients double-count; one 90 d scan, so the daily run computes it, not the hourly one.
+CREATE OR REPLACE MACRO rollup_window_clients(t1) AS TABLE
+WITH w AS (
+    SELECT grain, date_trunc(grain, t1 - rollup_window(grain)) AS window_start
+    FROM (VALUES ('hour'), ('day')) v(grain)
+),
+per_client AS (
+    SELECT grain, window_start, client_class, client_key, count(*) AS requests, sum(bytes) AS bytes
+    FROM hits JOIN w ON ts >= window_start
+    WHERE ts < t1
+      AND year BETWEEN year(t1 - INTERVAL 91 DAY) AND year(t1)
+      AND date BETWEEN CAST(t1 - INTERVAL 91 DAY AS DATE) AND CAST(t1 AS DATE)
+    GROUP BY ALL
+)
+SELECT grain, window_start, client_class, client_class_rule_version() AS rule_version,
+       CAST(sum(requests) AS BIGINT) AS requests, CAST(sum(bytes) AS BIGINT) AS bytes,
+       count(DISTINCT client_key) AS clients
+FROM per_client
+GROUP BY GROUPING SETS ((grain, window_start, client_class), (grain, window_start))
+ORDER BY grain, client_class NULLS FIRST;

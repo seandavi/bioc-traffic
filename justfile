@@ -51,27 +51,85 @@ rollups := env("BIOC_ROLLUPS", "/data/davsean/bioc-traffic-rollups")
 rollup_limits := "SET memory_limit = '32GB'; SET threads = 16; SET temp_directory = '/data/davsean/tmp/duckdb-rollups';"
 
 # <tier>.parquet is the whole tier, <tier>.json its overall series and window totals, both
-# written aside and renamed so a reader never sees a partial file. `day` also runs rollup-overall.
-# Dashboard rollups (#10): just rollup minute|hour|day
-rollup tier:
+# written aside and renamed so a reader never sees a partial file. minute recomputes its 6 h;
+# hour and day recompute only what upstream can have changed (rollup_late in
+# sql/rollup_tier.sql, or from yesterday with --since-yesterday, which the daily run uses after
+# the re-seal) and keep the rest. --full rebuilds the tier: after a classifier version bump or
+# a fix. `day` also runs rollup-overall and rollup-clients.
+# Dashboard rollups (#10, #19): just rollup minute|hour|day [--full|--since-yesterday]
+rollup tier mode="":
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p {{rollups}}
     out={{rollups}}/{{tier}}
+    case "{{tier}} {{mode}}" in
+      "minute ")
+        rows="FROM rollup_tier('minute', getvariable('t0'), getvariable('t1'))"
+        ti="NULL" ;;
+      "hour --full" | "day --full")
+        rows="FROM rollup_tier('{{tier}}', getvariable('t0'), getvariable('t1'), per_bucket := true)"
+        ti="NULL" ;;
+      "hour " | "day " | "hour --since-yesterday" | "day --since-yesterday")
+        [ -f "$out.parquet" ] || { echo "no $out.parquet: run with --full first" >&2; exit 1; }
+        rows="FROM rollup_merge('{{tier}}', '$out.parquet', getvariable('t0'), getvariable('ti'),
+                                getvariable('t1'))"
+        # Back to the last stored t too, in case runs were missed.
+        ti="greatest(getvariable('t0'), least((SELECT max(t) FROM read_parquet('$out.parquet')),"
+        if [ -z "{{mode}}" ]; then
+          ti="$ti date_trunc('{{tier}}', getvariable('t1') - rollup_late('{{tier}}'))))"
+        else
+          ti="$ti date_trunc('day', getvariable('t1')) - INTERVAL 1 DAY))"
+        fi ;;
+      *) echo "usage: just rollup minute | just rollup hour|day [--full|--since-yesterday]" >&2
+         exit 2 ;;
+    esac
+    if [ {{tier}} = minute ]; then
+      window="FROM read_parquet('$out.parquet.tmp') WHERE t IS NULL"
+      note="NULL"
+    else
+      window="SELECT NULL::TIMESTAMP AS t, dimension, value, client_class, NULL AS rule_version,
+                     CAST(sum(requests) AS BIGINT) AS requests, CAST(sum(bytes) AS BIGINT) AS bytes,
+                     NULL::BIGINT AS clients
+              FROM read_parquet('$out.parquet.tmp') GROUP BY dimension, value, client_class"
+      note="'Window rows (t null) sum the per-t rows. Top-N is per t, so page, referrer, '
+            || 'ua_family and package window values are approximate: a value never in the top N '
+            || 'of any single t is in (other). clients is null there on purpose: distinct '
+            || 'clients do not add. Exact window clients: window_clients.json.'"
+    fi
     just duckdb -c "{{rollup_limits}}" -c ".read sql/rollup_tier.sql" -c "
       SET VARIABLE t1 = now() AT TIME ZONE 'UTC';
       SET VARIABLE t0 = date_trunc('{{tier}}', getvariable('t1') - rollup_window('{{tier}}'));
-      COPY (FROM rollup_tier('{{tier}}', getvariable('t0'), getvariable('t1')))
-        TO '$out.parquet.tmp' (FORMAT parquet, COMPRESSION zstd);
+      SET VARIABLE ti = $ti;
+      COPY ($rows) TO '$out.parquet.tmp' (FORMAT parquet, COMPRESSION zstd);
       COPY (SELECT '{{tier}}' AS grain, getvariable('t0') AS window_start,
                    getvariable('t1') AS generated_at, client_class_rule_version() AS rule_version,
+                   $note AS note,
                    (SELECT list(r) FROM (SELECT * EXCLUDE (rule_version)
-                                         FROM read_parquet('$out.parquet.tmp')
-                                         WHERE dimension = 'overall' OR t IS NULL) r) AS rows)
+                                         FROM (FROM read_parquet('$out.parquet.tmp')
+                                               WHERE dimension = 'overall' AND t IS NOT NULL
+                                               UNION ALL $window)) r) AS rows)
         TO '$out.json.tmp' (FORMAT json);"
     mv "$out.parquet.tmp" "$out.parquet"
     mv "$out.json.tmp" "$out.json"
-    if [ {{tier}} = day ]; then just rollup-overall; fi
+    if [ {{tier}} = day ]; then just rollup-overall; just rollup-clients; fi
+
+# window_clients.parquet + .json, since the hour and day tiers' window rows have no clients.
+# One 90 d scan (per_client as in rollup_tier); `just rollup day` runs it.
+# Exact distinct clients over the 30 d and 90 d tier windows, overall and per client_class
+rollup-clients:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p {{rollups}}
+    out={{rollups}}/window_clients
+    just duckdb -c "{{rollup_limits}}" -c ".read sql/rollup_tier.sql" -c "
+      SET VARIABLE t1 = now() AT TIME ZONE 'UTC';
+      COPY (FROM rollup_window_clients(getvariable('t1')))
+        TO '$out.parquet.tmp' (FORMAT parquet, COMPRESSION zstd);
+      COPY (SELECT getvariable('t1') AS generated_at,
+                   (SELECT list(r) FROM read_parquet('$out.parquet.tmp') r) AS rows)
+        TO '$out.json.tmp' (FORMAT json);"
+    mv "$out.parquet.tmp" "$out.parquet"
+    mv "$out.json.tmp" "$out.json"
 
 # The first run computes it from 2020; later runs recompute the last 3 UTC days (late records,
 # the 08:00 re-seal) and keep the rest.
