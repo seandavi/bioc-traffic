@@ -161,8 +161,10 @@ def build_partitions(con, out, rebuild_all):
 # --- the package universe --------------------------------------------------------------
 
 def fetch(url):
+    # bioconductor.org (Cloudflare) answers 403 to the default Python-urllib User-Agent.
+    req = urllib.request.Request(url, headers={"User-Agent": "bioc-traffic download-stats"})
     try:
-        with urllib.request.urlopen(url, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=60) as r:
             return r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         if e.code == 404:
