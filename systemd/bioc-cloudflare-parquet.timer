@@ -1,0 +1,9 @@
+[Unit]
+Description=Hourly Parquet from Logpush, every 15 minutes
+
+[Timer]
+OnCalendar=*:00/15
+# ponytail: a missed run needs no catch-up; the nightly re-seal rewrites the whole day.
+
+[Install]
+WantedBy=timers.target

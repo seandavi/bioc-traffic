@@ -1,0 +1,12 @@
+[Unit]
+Description=Logpush access records -> hourly Parquet, re-seal yesterday (bioc-traffic#8)
+After=network-online.target
+Wants=network-online.target
+OnFailure=bioc-notify@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
+ExecStart=/home/davsean/.local/bin/uv run --script /home/davsean/Documents/git/bioc-traffic/cloudflare-logs-to-parquet.py --yesterday --upload
+# A day is ~1 min from GCS (measured 2026-09-30); allow for a slow network.
+TimeoutStartSec=2h

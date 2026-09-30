@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly re-seal of yesterday's hourly Parquet
+
+[Timer]
+# Records reach Logpush up to LATE (6 h) after their ts, so yesterday's objects are
+# complete from 06:00 UTC today. 08:00 UTC leaves margin.
+OnCalendar=*-*-* 08:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
