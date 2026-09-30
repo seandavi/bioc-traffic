@@ -60,6 +60,26 @@ bq query --project_id=bioc-u24 --use_legacy_sql=false \
    FROM `bioc-u24.logs.cf_workers_trace_raw` GROUP BY d ORDER BY d DESC LIMIT 7'
 ```
 
+**Hourly Parquet (#8): `cloudflare-logs-to-parquet.py`.** It parses the envelope once and
+writes one file per UTC hour of `ts` to `/data/davsean/bioc-cloudflare-parquet`
+(`year=/month=/day=/hour=/logs.parquet`, zstd, sorted by `ts`), then uploads to
+`r2:bioc-access-logs/parquet/cloudflare/` if verify passes. The columns are the 33 CloudFront
+columns (same names, order and types, with the BigQuery view's conversions), then `ts`, `cf_*`,
+`cf` (JSON text) and `client_id`. The run log counts skipped messages (non-JSON `waitUntil()`
+warnings, non-access types). `--verify` compares access records per hour in the raw objects
+with the Parquet. Measured on 2026-09-29: 6,367,023 records, **522 MB/day** (`cf` is 40% of
+that, `client_id` 13%), 45 s from GCS. Query both eras through `sql/access.sql`
+(`just duckdb`); `client_id` agrees across eras (all 104,856 IPs seen in both map to the same id).
+
+- **Records arrive late.** The trace event is emitted when the invocation finishes, so a
+  long download's record can land in an object up to hours after its `ts` (measured max 3.0 h).
+  Each hour is therefore built from objects up to 6 h past it, and the 08:00 UTC re-seal of
+  yesterday is the final version. The 15-minute run's last hours can be short until then.
+  A record later than 6 h is not written, and the run log counts it (`late beyond 6:00:00`).
+- **Coverage.** The CloudFront Parquet ends 2026-08-05 (a partial day, 146k rows). Logpush to
+  GCS starts 2026-08-06T20:19Z. Volume ramps up slowly: 6,212 records on 08-06, and objects
+  per day of 105 (08-15), 579 (09-01) and ~2,600 (from 09-10).
+
 Gotchas and state:
 
 - **R2 bucket `bioc-access-logs` is the abandoned pre-switch destination** — it holds only

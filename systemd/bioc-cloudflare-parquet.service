@@ -1,0 +1,13 @@
+[Unit]
+Description=Logpush access records -> hourly Parquet, current and previous UTC hour (bioc-traffic#8)
+After=network-online.target
+Wants=network-online.target
+OnFailure=bioc-notify@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
+# Builds, verifies, and uploads to R2 only if verify passes.
+ExecStart=/home/davsean/.local/bin/uv run --script /home/davsean/Documents/git/bioc-traffic/cloudflare-logs-to-parquet.py --recent --upload
+# Two hours take well under a minute; stop before the next 15-min run is due.
+TimeoutStartSec=14m
