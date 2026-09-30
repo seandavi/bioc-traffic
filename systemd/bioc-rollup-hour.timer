@@ -1,0 +1,10 @@
+[Unit]
+Description=Hour-tier dashboard rollup, hourly
+
+[Timer]
+# 5 min after the *:15 hourly-Parquet run, which rebuilds the hour just ended.
+OnCalendar=*:20
+# ponytail: a missed run needs no catch-up; the next one rebuilds the whole 30 d window.
+
+[Install]
+WantedBy=timers.target

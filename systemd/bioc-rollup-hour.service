@@ -1,0 +1,17 @@
+[Unit]
+Description=Dashboard rollups, hour tier -> Parquet + JSON, then R2 (bioc-traffic#10)
+After=network-online.target
+Wants=network-online.target
+OnFailure=bioc-notify@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
+# just, duckdb, gcloud, rclone
+Environment=PATH=/home/davsean/.local/bin:/usr/bin:/bin
+ExecStart=/home/davsean/.local/bin/just rollup hour
+ExecStart=/home/davsean/.local/bin/just rollup-upload
+# ~25 min for 30 d at the justfile's 32 GB / 16 threads, measured 2026-09-30 on a busy
+# onclappc02. Stop before the next hourly run is due.
+TimeoutStartSec=55m
+Nice=10

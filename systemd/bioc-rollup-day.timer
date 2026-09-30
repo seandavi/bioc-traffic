@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily day-tier dashboard rollup and forever overall series
+
+[Timer]
+# After the 08:00 UTC re-seal of yesterday and the 09:30 UTC download stats (~30 min), so
+# the two big DuckDB jobs do not overlap.
+OnCalendar=*-*-* 10:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
