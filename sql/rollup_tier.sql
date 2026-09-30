@@ -1,6 +1,6 @@
 -- Dashboard rollups, one tier at a time (seandavi/bioc-traffic#10). DuckDB.
 --
--- Load after sql/access.sql and sql/client_class.sql (`just rollup <tier>` does):
+-- Load after sql/access.sql and sql/client_class.sql (`just duckdb` loads both):
 --   FROM rollup_tier('hour', TIMESTAMP '2026-09-29', TIMESTAMP '2026-09-30')
 --
 -- One long table per tier: t, dimension, value, client_class, rule_version, requests, bytes,
@@ -9,7 +9,7 @@
 --
 -- Dimensions: overall ('all'), status_class ('2xx'), status, country (Cloudflare era only;
 -- CloudFront rows have none, not 'unknown'), ua_family, page, referrer (host), cache
--- (x_edge_result_type), package and release (package downloads only). page, referrer,
+-- (x_edge_result_type), package and bioc_version (package downloads only). page, referrer,
 -- ua_family and package keep their top_n values over the window, by requests; the rest
 -- is '(other)'.
 --
@@ -42,8 +42,9 @@ END;
 
 CREATE OR REPLACE MACRO ua_family_v0(ua) AS ua_family_v0_(client_ua_v0(ua));
 
--- The package-download definition of cloudfront-logs-to-parquet.py (PKG_URI, DOWNLOADS_SQL):
--- tarball and binary URIs, the status codes it counts, no HEAD. Keep the two in step.
+-- The fixed package-download definition (DOWNLOADS_SQL in cloudfront-logs-to-parquet.py, the
+-- downloads view in sql/downloads.sql): tarball and binary URIs, the status codes it counts,
+-- no HEAD. Keep all three in step.
 CREATE OR REPLACE MACRO package_download_v0(uri, status, method) AS
     regexp_matches(uri, '^/+packages/+[^/]+/+(bioc|workflows|data/+experiment|data/+annotation)'
                         || '/+(bin|src)/+.*_.*\.(tar\.gz|zip|tgz)$')
@@ -57,7 +58,7 @@ SELECT ts, year, date,
        hash(client_id) AS client_key,
        TRY_CAST(sc_bytes AS BIGINT) AS bytes,
        client_class_v0(cs_user_agent, cs_uri_stem, cs_method,
-                       bot_category := cf_bot_category, asn := cf_asn) AS client_class,
+                       bot_category := bot_category, asn := cf_asn) AS client_class,
        'all' AS overall,
        left(sc_status, 1) || 'xx' AS status_class,
        sc_status AS status,
@@ -71,7 +72,7 @@ SELECT ts, year, date,
        CASE WHEN package_download_v0(cs_uri_stem, sc_status, cs_method)
             THEN regexp_extract(cs_uri_stem, '/([^/_]+)_[^/]*\.(tar\.gz|zip|tgz)$', 1) END AS package,
        CASE WHEN package_download_v0(cs_uri_stem, sc_status, cs_method)
-            THEN regexp_extract(cs_uri_stem, '^/+packages/+([^/]+)/', 1) END AS release
+            THEN regexp_extract(cs_uri_stem, '^/+packages/+([^/]+)/', 1) END AS bioc_version
 FROM access
 WHERE production;
 
@@ -92,8 +93,8 @@ WITH h AS (
 ),
 long AS NOT MATERIALIZED (
     UNPIVOT (SELECT ts, client_key, bytes, client_class, overall, status_class, status, country,
-                    ua_family, page, referrer, cache, package, release FROM h)
-    ON overall, status_class, status, country, ua_family, page, referrer, cache, package, release
+                    ua_family, page, referrer, cache, package, bioc_version FROM h)
+    ON overall, status_class, status, country, ua_family, page, referrer, cache, package, bioc_version
     INTO NAME dimension VALUE value
 ),
 top AS (

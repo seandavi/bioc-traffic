@@ -2,8 +2,8 @@
 -- eras, overall only, so it stays cheap. DuckDB, after sql/access.sql:
 --   FROM rollup_overall_day(DATE '2026-09-29', DATE '2026-09-30')
 --
--- History is computed once (`just rollup-history`); `just rollup day` recomputes the last few
--- days and appends. era separates the seam instead of smoothing it; no client_class here, since
+-- `just rollup-overall` computes the history once, then recomputes the last 3 days and keeps
+-- the rest; `just rollup day` runs it. era separates the seam instead of smoothing it; no client_class here, since
 -- the classes are not comparable across eras (#11). clients (distinct client_id) is per day and
 -- era and does not add across rows.
 

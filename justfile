@@ -58,7 +58,7 @@ rollup tier:
     set -euo pipefail
     mkdir -p {{rollups}}
     out={{rollups}}/{{tier}}
-    just duckdb -c "{{rollup_limits}}" -c ".read sql/client_class.sql" -c ".read sql/rollup_tier.sql" -c "
+    just duckdb -c "{{rollup_limits}}" -c ".read sql/rollup_tier.sql" -c "
       SET VARIABLE t1 = now() AT TIME ZONE 'UTC';
       SET VARIABLE t0 = date_trunc('{{tier}}', getvariable('t1') - rollup_window('{{tier}}'));
       COPY (FROM rollup_tier('{{tier}}', getvariable('t0'), getvariable('t1')))
