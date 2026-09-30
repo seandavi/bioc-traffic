@@ -1,0 +1,9 @@
+[Unit]
+Description=Alert if the Logpush gap check has not succeeded in 36h (dead-man)
+OnFailure=bioc-notify@%N.service
+
+[Service]
+Type=oneshot
+# check-logpush.sh touches this stamp after each passing scheduled run; the
+# stamp is missing or older than 36h if the check stopped running or kept failing.
+ExecStart=/bin/sh -c 'find %S/bioc-logpush-check.ok -mmin -2160 | grep -q .'

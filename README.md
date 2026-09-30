@@ -7,7 +7,7 @@ that seam. This repo is private: it names buckets, job IDs and secrets.
 | Piece | What |
 |---|---|
 | `ANALYTICS.md` | What exists, where, and how to query it. Start here. |
-| `check-logpush.sh` + `systemd/` | Daily gap alarm on yesterday's delivery (ADR 0003). Timer is installed on onclappc02. |
+| `check-logpush.sh` + `systemd/` | Daily gap alarm on yesterday's delivery (ADR 0003): every UTC hour present, plus a minimum object count. `./check-logpush.sh 20260928` checks any day. Timer is installed on onclappc02. |
 | `cloudfront-logs-to-parquet.py` | The one-shot CloudFront-era mirror to Parquet, with `--verify`. |
 | `sql/cloudflare_access.bq.sql` | The BigQuery normalising view, as extracted with `bq show`. |
 
@@ -18,8 +18,15 @@ views).
 ## Install the timer
 
 ```bash
-ln -sf "$PWD"/systemd/bioc-logpush-check.{service,timer} ~/.config/systemd/user/
+ln -sf "$PWD"/systemd/bioc-logpush-check{,-stale}.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now bioc-logpush-check.timer
+# Seed the dead-man stamp before arming its timer, or it alerts at the next noon.
+systemctl --user start bioc-logpush-check.service
+systemctl --user enable --now bioc-logpush-check-stale.timer
 ```
+
+`bioc-logpush-check-stale` is the dead-man: it fails if the check has not passed in 36h
+(`~/.local/state/bioc-logpush-check.ok`), whether the timer stopped or the check keeps failing.
+`LOGPUSH_PREFIX` takes `gs://…` (gcloud) or an rclone `remote:path` such as `r2:…`.
 
 `bioc-notify@.service` is shared with the sync timers and is installed from `bioc-edge`.
