@@ -47,6 +47,8 @@ stats-self-check:
     ./download-stats.py --self-check
 
 rollups := env("BIOC_ROLLUPS", "/data/davsean/bioc-traffic-rollups")
+# A shared, busy host: cap DuckDB, spill to /data rather than /tmp.
+rollup_limits := "SET memory_limit = '32GB'; SET threads = 16; SET temp_directory = '/data/davsean/tmp/duckdb-rollups';"
 
 # <tier>.parquet is the whole tier, <tier>.json its overall series and window totals, both
 # written aside and renamed so a reader never sees a partial file. `day` also runs rollup-overall.
@@ -56,7 +58,7 @@ rollup tier:
     set -euo pipefail
     mkdir -p {{rollups}}
     out={{rollups}}/{{tier}}
-    just duckdb -c ".read sql/client_class.sql" -c ".read sql/rollup_tier.sql" -c "
+    just duckdb -c "{{rollup_limits}}" -c ".read sql/client_class.sql" -c ".read sql/rollup_tier.sql" -c "
       SET VARIABLE t1 = now() AT TIME ZONE 'UTC';
       SET VARIABLE t0 = date_trunc('{{tier}}', getvariable('t1') - rollup_window('{{tier}}'));
       COPY (FROM rollup_tier('{{tier}}', getvariable('t0'), getvariable('t1')))
@@ -85,7 +87,7 @@ rollup-overall:
     else
       d0="DATE '2020-01-01'"; keep=""
     fi
-    just duckdb -c ".read sql/rollup_overall.sql" -c "
+    just duckdb -c "{{rollup_limits}}" -c ".read sql/rollup_overall.sql" -c "
       COPY ($keep FROM rollup_overall_day($d0, $today) ORDER BY day, era)
         TO '$out.parquet.tmp' (FORMAT parquet, COMPRESSION zstd);
       COPY (SELECT now() AT TIME ZONE 'UTC' AS generated_at,
