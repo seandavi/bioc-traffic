@@ -1,0 +1,16 @@
+[Unit]
+Description=Dashboard rollups, minute tier -> Parquet + JSON, then R2 (bioc-traffic#10)
+After=network-online.target
+Wants=network-online.target
+OnFailure=bioc-notify@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
+# just, duckdb, gcloud, rclone
+Environment=PATH=/home/davsean/.local/bin:/usr/bin:/bin
+ExecStart=/home/davsean/.local/bin/just rollup minute
+ExecStart=/home/davsean/.local/bin/just rollup-upload
+# ~3 s. Stop before the next 15-min run is due.
+TimeoutStartSec=14m
+Nice=10

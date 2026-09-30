@@ -1,0 +1,17 @@
+[Unit]
+Description=Dashboard rollups, day tier and the forever overall series -> Parquet + JSON, then R2 (bioc-traffic#10)
+After=network-online.target
+Wants=network-online.target
+OnFailure=bioc-notify@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
+# just, duckdb, gcloud, rclone
+Environment=PATH=/home/davsean/.local/bin:/usr/bin:/bin
+ExecStart=/home/davsean/.local/bin/just rollup day
+ExecStart=/home/davsean/.local/bin/just rollup-upload
+# ~48 min for 90 d, plus ~2 s for the overall series (~11 min the first time, from 2020),
+# measured 2026-09-30 on a busy onclappc02.
+TimeoutStartSec=3h
+Nice=10

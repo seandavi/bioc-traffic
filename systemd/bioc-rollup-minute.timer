@@ -1,0 +1,10 @@
+[Unit]
+Description=Minute-tier dashboard rollup, every 15 minutes
+
+[Timer]
+# 5 min after each hourly-Parquet run (*:00/15).
+OnCalendar=*:05/15
+# ponytail: a missed run needs no catch-up; the next one rebuilds the whole 6 h window.
+
+[Install]
+WantedBy=timers.target

@@ -13,6 +13,7 @@ that seam. This repo is private: it names buckets, job IDs and secrets.
 | `sql/access.sql` | DuckDB `access` view: both eras, `era` and `client_id` columns. `just duckdb` (also loads `client_class.sql` and `downloads.sql`). |
 | `sql/cloudflare_access.bq.sql` | The BigQuery normalising view, as extracted with `bq show`. |
 | `download-stats.py` + `sql/downloads.sql` | Package download stats across both eras (#11): monthly client partitions, Parquet aggregates with fixed and human/automated columns, the `/packages/stats/` tree (ADR 0004). `just stats`; see `ANALYTICS.md`. |
+| `sql/rollup_tier.sql`, `sql/rollup_overall.sql` | Dashboard rollups (#10): minute/6 h, hour/30 d, day/90 d by class, status, country, UA family, page, referrer, cache, package and `bioc_version`; plus the forever per-day overall series, both eras. Static Parquet + JSON in `$BIOC_ROLLUPS` (default `/data/davsean/bioc-traffic-rollups`), then R2 `rollups/`. `just rollup minute\|hour\|day`. |
 | `sql/client_class.sql` | `client_class_v0(...)`: per-request traffic class for both eras (#5), DuckDB macros. Check: `duckdb -c ".read sql/client_class.sql" -c ".read sql/client_class_check.sql"`. |
 
 Decisions are cross-repo and live in `bioc-infrastructure/adr` — 0002 (mirror unfiltered),
@@ -47,6 +48,15 @@ The daily download-stats timer (09:30 UTC, after the re-seal) is **not installed
 ```bash
 ln -sf "$PWD"/systemd/bioc-download-stats.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now bioc-download-stats.timer
+```
+
+The rollup timers (minute tier every 15 min, ~3 s; hour tier hourly, ~25 min; day tier and the
+overall series at 10:30 UTC, ~50 min) are **not installed yet**:
+
+```bash
+ln -sf "$PWD"/systemd/bioc-rollup-{minute,hour,day}.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now bioc-rollup-minute.timer bioc-rollup-hour.timer bioc-rollup-day.timer
 ```
 
 `bioc-notify@.service` is shared with the sync timers and is installed from `bioc-edge`.
