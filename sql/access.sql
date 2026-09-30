@@ -3,7 +3,8 @@
 --   cloudfront_access   CloudFront Parquet, 2020-01-01 .. 2026-08-05 (cloudfront-logs-to-parquet.py)
 --   cloudflare_access   Logpush Parquet, hourly, from 2026-08-06 (cloudflare-logs-to-parquet.py)
 --   access              both, UNION ALL: the 33 CloudFront columns, year, month, ts, era, client_id,
---                       production
+--                       production, and the client_class_v0 inputs only the Cloudflare era has
+--                       (cf_asn, bot_category = cf.verifiedBotCategory; NULL for CloudFront)
 --
 -- No time cut between eras. After the 2026-09-28 cutover CloudFront keeps serving clients
 -- with cached DNS, and before it the Worker served only a dev host, so a request is in
@@ -40,7 +41,8 @@ SELECT date, time, x_edge_location, sc_bytes, c_ip, cs_method, cs_host, cs_uri_s
        x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port,
        time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len,
        sc_range_start, sc_range_end, year, month, ts, era, client_id,
-       regexp_matches(lower(x_host_header), '^(www\.)?bioconductor\.org\.?(:[0-9]+)?$') AS production
+       regexp_matches(lower(x_host_header), '^(www\.)?bioconductor\.org\.?(:[0-9]+)?$') AS production,
+       NULL::BIGINT AS cf_asn, NULL::VARCHAR AS bot_category
 FROM cloudfront_access
 UNION ALL
 SELECT date, time, x_edge_location, sc_bytes, c_ip, cs_method, cs_host, cs_uri_stem, sc_status,
@@ -49,5 +51,6 @@ SELECT date, time, x_edge_location, sc_bytes, c_ip, cs_method, cs_host, cs_uri_s
        x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port,
        time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len,
        sc_range_start, sc_range_end, year, month, ts, era, client_id,
-       regexp_matches(lower(x_host_header), '^(www\.)?bioconductor\.org\.?(:[0-9]+)?$') AS production
+       regexp_matches(lower(x_host_header), '^(www\.)?bioconductor\.org\.?(:[0-9]+)?$') AS production,
+       cf_asn, cf->>'verifiedBotCategory' AS bot_category
 FROM cloudflare_access;
