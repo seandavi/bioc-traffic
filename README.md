@@ -10,8 +10,9 @@ that seam. This repo is private: it names buckets, job IDs and secrets.
 | `check-logpush.sh` + `systemd/` | Daily gap alarm on yesterday's delivery (ADR 0003): every UTC hour present, plus a minimum object count. `./check-logpush.sh 20260928` checks any day. Timer is installed on onclappc02. |
 | `cloudfront-logs-to-parquet.py` | The one-shot CloudFront-era mirror to Parquet, with `--verify`. |
 | `cloudflare-logs-to-parquet.py` + `justfile` | Logpush records → hourly Parquet (local, then R2), with `--verify` (#8). `just --list`. |
-| `sql/access.sql` | DuckDB `access` view: both eras, `era` and `client_id` columns. `just duckdb`. |
+| `sql/access.sql` | DuckDB `access` view: both eras, `era` and `client_id` columns. `just duckdb` (also loads `client_class.sql` and `downloads.sql`). |
 | `sql/cloudflare_access.bq.sql` | The BigQuery normalising view, as extracted with `bq show`. |
+| `download-stats.py` + `sql/downloads.sql` | Package download stats across both eras (#11): monthly client partitions, Parquet aggregates with fixed and human/automated columns, the `/packages/stats/` tree (ADR 0004). `just stats`; see `ANALYTICS.md`. |
 | `sql/client_class.sql` | `client_class_v0(...)`: per-request traffic class for both eras (#5), DuckDB macros. Check: `duckdb -c ".read sql/client_class.sql" -c ".read sql/client_class_check.sql"`. |
 
 Decisions are cross-repo and live in `bioc-infrastructure/adr` — 0002 (mirror unfiltered),
@@ -39,6 +40,13 @@ yesterday) are installed on onclappc02:
 ln -sf "$PWD"/systemd/bioc-cloudflare-parquet{,-reseal}.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now bioc-cloudflare-parquet.timer bioc-cloudflare-parquet-reseal.timer
+```
+
+The daily download-stats timer (09:30 UTC, after the re-seal) is **not installed yet**:
+
+```bash
+ln -sf "$PWD"/systemd/bioc-download-stats.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now bioc-download-stats.timer
 ```
 
 `bioc-notify@.service` is shared with the sync timers and is installed from `bioc-edge`.

@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily package download stats
+
+[Timer]
+# After the 08:00 UTC re-seal of yesterday's hourly Parquet.
+OnCalendar=*-*-* 09:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
