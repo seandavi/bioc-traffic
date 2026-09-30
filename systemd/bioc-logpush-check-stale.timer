@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily dead-man check on bioc-logpush-check
+
+[Timer]
+# Hours after the 07:15 check, so one missed run trips it within about two days.
+OnCalendar=*-*-* 12:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
