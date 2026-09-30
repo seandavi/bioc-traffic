@@ -73,13 +73,10 @@ rollup tier mode="":
         [ -f "$out.parquet" ] || { echo "no $out.parquet: run with --full first" >&2; exit 1; }
         rows="FROM rollup_merge('{{tier}}', '$out.parquet', getvariable('t0'), getvariable('ti'),
                                 getvariable('t1'))"
-        # Back to the last stored t too, in case runs were missed.
-        ti="greatest(getvariable('t0'), least((SELECT max(t) FROM read_parquet('$out.parquet')),"
-        if [ -z "{{mode}}" ]; then
-          ti="$ti date_trunc('{{tier}}', getvariable('t1') - rollup_late('{{tier}}'))))"
-        else
-          ti="$ti date_trunc('day', getvariable('t1')) - INTERVAL 1 DAY))"
-        fi ;;
+        since="NULL"
+        [ -z "{{mode}}" ] || since="date_trunc('day', getvariable('t1')) - INTERVAL 1 DAY"
+        ti="rollup_start('{{tier}}', getvariable('t0'), getvariable('t1'),
+                         (SELECT max(t) FROM read_parquet('$out.parquet')), since := $since)" ;;
       *) echo "usage: just rollup minute | just rollup hour|day [--full|--since-yesterday]" >&2
          exit 2 ;;
     esac

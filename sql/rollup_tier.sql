@@ -95,6 +95,11 @@ CREATE OR REPLACE MACRO rollup_late(grain) AS CASE grain
     WHEN 'day' THEN INTERVAL 1 DAY
     ELSE error('grain must be hour or day') END;
 
+-- Where an incremental run starts: rollup_late back from t1, or since if earlier, or the last
+-- stored t if runs were missed; never before t0. NULLs are ignored.
+CREATE OR REPLACE MACRO rollup_start(grain, t0, t1, last_t, since := NULL) AS
+    greatest(t0, least(last_t, date_trunc(grain, t1 - rollup_late(grain)), since));
+
 CREATE OR REPLACE MACRO rollup_tier(grain, t0, t1, top_n := 25, per_bucket := false) AS TABLE
 WITH h AS (
     FROM hits
