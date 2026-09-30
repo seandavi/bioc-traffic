@@ -30,9 +30,18 @@ reseal:
 backfill to:
     {{script}} --from 2026-08-06 --to {{to}} --upload
 
-# DuckDB with sql/access.sql loaded and the salt set: just duckdb [-c "SELECT ..."]
+# DuckDB with sql/{access,client_class,downloads}.sql loaded, salt set: just duckdb [-c "SELECT ..."]
 # The salt goes through the environment, not argv or disk; $(...) trims its newline.
 [positional-arguments]
 duckdb *args:
     @BIOC_IP_SALT="$(gcloud secrets versions access latest --secret bioc-logs-ip-salt --project cdsci-infra)" \
-      duckdb -init sql/access.sql -cmd "SET VARIABLE ip_salt = getenv('BIOC_IP_SALT')" "$@"
+      duckdb -init sql/access.sql -cmd "SET VARIABLE ip_salt = getenv('BIOC_IP_SALT')" \
+        -cmd ".read sql/client_class.sql" -cmd ".read sql/downloads.sql" "$@"
+
+# Package download stats (#11): stale monthly partitions, aggregates, the /packages/stats/ tree
+stats *args:
+    ./download-stats.py {{args}}
+
+# download-stats.py checks: downloads view = DOWNLOADS_SQL, aggregates, .tab format
+stats-self-check:
+    ./download-stats.py --self-check

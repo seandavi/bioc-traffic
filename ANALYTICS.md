@@ -93,6 +93,42 @@ Gotchas and state:
   runs ~2600/day since the cutover) delivered objects. Logpush cannot backfill, so this is the
   alarm ADR 0003 requires. Known residual gap: nothing external notices if the timer itself stops firing.
 
+## Package download stats (#11)
+
+`download-stats.py` (`just stats`; timer `bioc-download-stats`, not installed) writes under
+`/data/davsean/bioc-traffic-stats`, nothing public:
+
+- `clients/year=/month=/clients.parquet` — per (date, category, package, bioc_version,
+  client_id, client_class, era) download counts from the `downloads` view (`sql/downloads.sql`,
+  the DOWNLOADS_SQL filter), production hosts only. Internal (carries `client_id`). A month is
+  rebuilt only when a source Parquet file of that month is newer, so CloudFront history is
+  computed once. 81 months (2020-01 → 2026-09), 7.1 GB; the backfill took ~1 h 20 min
+  (10–240 s a month on a loaded host, 2026-09-30).
+- `package_month`, `package_day` (last 90 days), `release_month`, `category_month`,
+  `overall_month` `.parquet` — fixed columns `downloads`, `distinct_clients`; interpretive
+  `downloads_{human,package_client,automated}` + `distinct_clients_*` (client_class_v0),
+  `rule_version`, `era`. Rebuilt every run (~15 min).
+- `stats/` — the `/packages/stats/` tree of ADR 0004 from the fixed columns (~13 min).
+
+Things that shape the numbers:
+
+- **CloudFront 302s any `/packages/<v>/<cat>/…_x.tar.gz`**, so the raw filter yields junk
+  names (July 2026 workflows: ~1,800 "packages"). Aggregates and the tree count only
+  (category, package) pairs listed in some release's `src/contrib/PACKAGES`
+  (`packages-index/`, cached; release and devel refetched each run).
+- **Category comes from the URL**, as in DOWNLOADS_SQL. The published files sometimes also count
+  a package's requests under *other* category paths (DESeq2 2026-07: published 116,410 =
+  bioc 91,752 + data-annotation 12,141 + data-experiment 6,145 + workflows 6,105 within
+  0.2%), but not consistently (applying that rule to all months puts BiocGenerics 2024-12 at
+  +66%). Ordinary months run 0.2–0.9% below published for bioc packages.
+- **The human/automated split steps at the 2026-09-28 cutover** for classifier reasons: only
+  the Cloudflare era has `bot_category` and `cf_asn`. The fixed columns are continuous
+  across it.
+- **Mid-Aug → Sep 2026 is ~2× normal** in both published and ours: `likely_automated`
+  (~15k clients, ~4M downloads a week) plus ~1.9M distinct browser-UA clients a week.
+- **bioconductor.org returns 403 to the Python-urllib User-Agent** (since it moved behind
+  Cloudflare); send one.
+
 ## Connecting
 
 ### Trino — **not currently running**
