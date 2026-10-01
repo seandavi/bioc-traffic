@@ -46,7 +46,7 @@ if [[ $missing != - ]] || (( n < MIN_OBJECTS )); then
   [[ $missing != - ]] && echo "GAP: no objects for $day UTC hours $missing." >&2
   (( n < MIN_OBJECTS )) && echo "GAP: $n objects delivered for $day (need >= $MIN_OBJECTS)." >&2
   echo "Logpush cannot backfill; every day this persists is unrecoverable." >&2
-  echo "Check: job 1826554 status, and https://dash.cloudflare.com Logpush health." >&2
+  echo "Check the Logpush job's health in the Cloudflare dashboard (job ID: ANALYTICS.local.md)." >&2
   exit 1
 fi
 

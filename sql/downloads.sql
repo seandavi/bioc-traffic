@@ -7,7 +7,7 @@
 -- Python copy (download-stats.py --self-check asserts it). sc_status is VARCHAR in both eras.
 --
 -- `production` is a column, not a filter here: the stats filter on it (dev traffic on
--- bioc-dev.cancerdatasci.org hits the same paths). client_class is interpretive and
+-- a dev hostname hits the same paths). client_class is interpretive and
 -- carries its rule version; the Cloudflare era feeds it cf_asn and bot_category, the
 -- CloudFront era cannot, so the human/automated split steps at the cutover (#11).
 --
