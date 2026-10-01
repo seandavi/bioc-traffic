@@ -38,7 +38,8 @@ duckdb *args:
       duckdb -init sql/access.sql -cmd "SET VARIABLE ip_salt = getenv('BIOC_IP_SALT')" \
         -cmd ".read sql/client_class.sql" -cmd ".read sql/downloads.sql" "$@"
 
-# Package download stats (#11): stale monthly partitions, aggregates, the /packages/stats/ tree
+# Package download stats (#11): stale monthly partitions, aggregates (with the published
+# months before 2020 from published_month.parquet, #24), the /packages/stats/ tree
 stats *args:
     ./download-stats.py {{args}}
 
