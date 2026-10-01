@@ -127,7 +127,7 @@ folded AS (
                 THEN '(other)' ELSE value END AS v,
            client_class, client_key, bytes
     FROM long LEFT JOIN top ON long.dimension = top.dimension AND long.value = top.top_value
-                           AND (NOT per_bucket OR long.t = top.top_t)
+                           AND top.top_t IS NOT DISTINCT FROM CASE WHEN per_bucket THEN long.t END
 ),
 -- One row per client first: a plain GROUP BY spills well, and the DISTINCT below then sees
 -- far fewer rows. Straight off folded, a 30 d hour tier took 50 min at 32 GB; this is ~6x
@@ -141,10 +141,14 @@ SELECT t, dimension, v AS value, client_class, client_class_rule_version() AS ru
        CAST(sum(requests) AS BIGINT) AS requests, CAST(sum(bytes) AS BIGINT) AS bytes,
        count(DISTINCT client_key) AS clients
 FROM per_client
-GROUP BY GROUPING SETS ((t, dimension, v, client_class), (t, dimension, v),
-                        (dimension, v, client_class), (dimension, v))
--- ponytail: per_bucket still computes the window sets, then drops them; costs only in --full.
-HAVING NOT per_bucket OR t IS NOT NULL
+GROUP BY GROUPING SETS ((t, dimension, v, client_class), (t, dimension, v))
+UNION ALL
+-- The whole-window rows, t NULL; per_bucket tiers skip them.
+SELECT NULL, dimension, v, client_class, client_class_rule_version(),
+       CAST(sum(requests) AS BIGINT), CAST(sum(bytes) AS BIGINT), count(DISTINCT client_key)
+FROM per_client
+WHERE NOT per_bucket
+GROUP BY GROUPING SETS ((dimension, v, client_class), (dimension, v))
 ORDER BY dimension, t NULLS FIRST, requests DESC;
 
 -- A stored per_bucket tier brought up to t1: its rows in [t0, ti) kept, [ti, t1) recomputed,
