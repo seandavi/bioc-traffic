@@ -31,6 +31,12 @@ Three stages, all under --out (default /data/davsean/bioc-traffic-stats):
    'cloudfront', 'cloudflare' or 'cloudflare+cloudfront'). The Cloudflare era feeds the
    classifier cf_asn and verifiedBotCategory and the CloudFront era cannot, so the class
    columns step at the 2026-09-28 cutover for classifier reasons; the fixed ones do not.
+   `source` is 'logs' for these. package_month, category_month and overall_month also
+   carry the months before JOIN (2020-01, where the logs start) from the published
+   /packages/stats/ snapshot (published-stats-mirror.py, #24) as source = 'published':
+   `downloads`, and `distinct_clients` = its distinct IPs, NULL in overall_month (they
+   do not add across categories); every other column NULL. Without --published's file
+   they are left out.
 
 3. stats/ — the /packages/stats/ tree (ADR 0004 contract) from the fixed columns:
      <cat>/<pkg>/<pkg>_stats.tab, <cat>/<pkg>/<pkg>_<year>_stats.tab
@@ -56,6 +62,8 @@ import argparse, datetime as dt, os, pathlib, re, runpy, shutil, sys, tempfile, 
 HERE = pathlib.Path(__file__).resolve().parent
 OUT = pathlib.Path("/data/davsean/bioc-traffic-stats")
 SCRATCH = pathlib.Path("/data/davsean/tmp")   # /tmp is small on onclappc02
+PUBLISHED = pathlib.Path("/data/davsean/bioc-published-stats/published_month.parquet")
+JOIN = "2020-01-01"   # the first month of the logs; published numbers before it
 CLOUDFRONT = pathlib.Path("/data/davsean/bioc-cf-parquet")
 CLOUDFLARE = pathlib.Path("/data/davsean/bioc-cloudflare-parquet")
 SQL = [HERE / "sql" / f for f in ("access.sql", "client_class.sql", "downloads.sql")]
@@ -89,6 +97,15 @@ AGGREGATES = {
     "release_month": ("month, bioc_version", "true"),
     "category_month": ("month, category", "true"),
     "overall_month": ("month", "true"),
+}
+# name -> its published rows before JOIN, from the published_history view.
+HISTORY = {
+    "package_month": "SELECT month, category, package, downloads, distinct_ips AS distinct_clients "
+                     "FROM published_history WHERE package IS NOT NULL",
+    "category_month": "SELECT month, category, downloads, distinct_ips AS distinct_clients "
+                      "FROM published_history WHERE package IS NULL",
+    "overall_month": "SELECT month, sum(downloads)::BIGINT AS downloads, NULL::BIGINT AS distinct_clients "
+                     "FROM published_history WHERE package IS NULL GROUP BY month",
 }
 
 
@@ -208,13 +225,26 @@ def load_repo_downloads(con, out, universe):
         raise SystemExit(f"partitions mix client_class rule versions {versions}; rerun with --all")
 
 
-def write_aggregates(con, out):
+def write_aggregates(con, out, published=None):
+    history = published is not None and published.exists()
+    if history:
+        con.execute(f"""
+            CREATE OR REPLACE VIEW published_history AS
+            SELECT make_date(year, month, 1) AS month, category, package, downloads, distinct_ips
+            FROM read_parquet('{published}')
+            WHERE tree = 'stats' AND downloads > 0 AND make_date(year, month, 1) < DATE '{JOIN}'""")
+    elif published:
+        print(f"  no {published}: aggregates start at {JOIN}", flush=True)
     for name, (keys, where) in AGGREGATES.items():
         t0 = time.time()
-        replace_file(con, f"SELECT {keys},\n       {MEASURES}\nFROM repo_downloads WHERE {where}\n"
-                          f"GROUP BY {keys} ORDER BY {keys}", out / f"{name}.parquet")
-        n = con.execute(f"SELECT count(*) FROM '{out / name}.parquet'").fetchone()[0]
-        print(f"  {name}: {n:,d} rows  {time.time() - t0:.0f}s", flush=True)
+        query = (f"SELECT {keys},\n       {MEASURES},\n       'logs' AS source\n"
+                 f"FROM repo_downloads WHERE {where}\nGROUP BY {keys}")
+        if name in HISTORY and history:
+            query += f"\nUNION ALL BY NAME\nSELECT *, 'published' AS source FROM ({HISTORY[name]})"
+        replace_file(con, f"FROM ({query}) ORDER BY {keys}", out / f"{name}.parquet")
+        n, h = con.execute(f"SELECT count(*), count(*) FILTER (source = 'published') "
+                           f"FROM '{out / name}.parquet'").fetchone()
+        print(f"  {name}: {n:,d} rows ({h:,d} published)  {time.time() - t0:.0f}s", flush=True)
 
 
 # --- stage 3: the /packages/stats/ tree ------------------------------------------------
@@ -290,13 +320,13 @@ def write_stats(con, out):
     print(f"  stats/: {n_files:,d} files, data as of {as_of}  {time.time() - t0:.0f}s", flush=True)
 
 
-def run(out, rebuild_all, salt):
+def run(out, rebuild_all, salt, published):
     con = connect(salt)
     print("partitions:", flush=True)
     build_partitions(con, out, rebuild_all)
     print("aggregates:", flush=True)
     load_repo_downloads(con, out, package_universe(out))
-    write_aggregates(con, out)
+    write_aggregates(con, out, published)
     write_stats(con, out)
 
 
@@ -372,18 +402,38 @@ def self_check():
         assert (s / "bioc_stats.tab").read_text().split("\n")[2] == "2026\tFeb\t2\t3"
         assert (s / "bioc_pkg_stats.tab").read_text().split("\n")[1] == "limma\t2026\tJan\t0\t0"
         assert not (out / "stats" / "workflows" / "limma").exists(), "not in the workflows universe"
-    print("self-check OK (downloads view = DOWNLOADS_SQL filter; aggregates; stats tree format)")
+
+        # Published history: months before JOIN, tree 'stats', non-zero; the rest ignored.
+        pub = out / "published_month.parquet"
+        con.execute(f"""COPY (FROM (VALUES ('stats', 'bioc', 'limma', 2019, 12, 5, 7),
+            ('stats', 'bioc', NULL, 2019, 12, 9, 20), ('stats', 'data-annotation', NULL, 2019, 12, 4, 6),
+            ('stats', 'bioc', 'limma', 2020, 1, 99, 99), ('oldstats', 'bioc', 'limma', 2018, 1, 1, 1),
+            ('stats', 'bioc', 'limma', 2019, 11, 0, 0))
+            v(tree, category, package, year, month, distinct_ips, downloads)) TO '{pub}' (FORMAT parquet)""")
+        write_aggregates(con, out, pub)
+        got = {n: con.execute(f"SELECT * EXCLUDE (source) FROM '{out}/{n}.parquet' WHERE source = 'published'").fetchall()
+               for n in HISTORY}
+        none = (None,) * 8
+        assert got == {"package_month": [(dt.date(2019, 12, 1), "bioc", "limma", 7, 5, *none)],
+                       "category_month": [(dt.date(2019, 12, 1), "bioc", 20, 9, *none),
+                                          (dt.date(2019, 12, 1), "data-annotation", 6, 4, *none)],
+                       "overall_month": [(dt.date(2019, 12, 1), 26, None, *none)]}, got
+        assert con.execute(f"SELECT count(*) FROM '{out}/package_month.parquet' WHERE source = 'logs' "
+                           "AND month = DATE '2026-02-01'").fetchone()[0] == 3
+    print("self-check OK (downloads view = DOWNLOADS_SQL filter; aggregates; published history; stats tree format)")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default=OUT, type=pathlib.Path, help=f"output directory (default {OUT})")
     ap.add_argument("--all", action="store_true", help="rebuild every monthly partition")
+    ap.add_argument("--published", default=PUBLISHED, type=pathlib.Path,
+                    help=f"published_month.parquet for the months before {JOIN} (default {PUBLISHED})")
     ap.add_argument("--self-check", action="store_true", help="run the built-in checks and exit")
     a = ap.parse_args()
     if a.self_check:
         return self_check()
-    run(a.out, a.all, ip_salt())
+    run(a.out, a.all, ip_salt(), a.published)
 
 
 if __name__ == "__main__":

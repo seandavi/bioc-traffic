@@ -33,9 +33,11 @@ number it produces carries its rule version, so history recomputes when the rule
 
 ## What it produces
 
-- **Package download statistics, 2020 to today, across both eras.** Counts that match the
-  long-published `/packages/stats/` figures, plus separate human, package-client and
-  automated columns.
+- **Package download statistics, 2009 to today.** From 2020, computed from the logs across
+  both eras, on the long-published `/packages/stats/` definition, plus separate human,
+  package-client and automated columns. Before 2020, the published figures themselves,
+  mirrored whole ([#24](../../issues/24)); where and why the two differ since 2020 is in
+  [docs/published-comparison.md](docs/published-comparison.md).
 - **A traffic dashboard's worth of rollups.** Per minute, hour and day, by class, status,
   country, page, referrer and package. A public dashboard built from them is next
   ([#6](../../issues/6)).

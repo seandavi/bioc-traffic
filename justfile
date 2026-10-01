@@ -38,7 +38,8 @@ duckdb *args:
       duckdb -init sql/access.sql -cmd "SET VARIABLE ip_salt = getenv('BIOC_IP_SALT')" \
         -cmd ".read sql/client_class.sql" -cmd ".read sql/downloads.sql" "$@"
 
-# Package download stats (#11): stale monthly partitions, aggregates, the /packages/stats/ tree
+# Package download stats (#11): stale monthly partitions, aggregates (with the published
+# months before 2020 from published_month.parquet, #24), the /packages/stats/ tree
 stats *args:
     ./download-stats.py {{args}}
 
@@ -154,3 +155,30 @@ rollup-overall:
 # Copy the rollups to R2 (the private bucket; nothing here is public)
 rollup-upload:
     rclone copy {{rollups}} r2:bioc-access-logs/rollups/ --exclude '*.tmp'
+
+published := env("BIOC_PUBLISHED", "/data/davsean/bioc-published-stats")
+
+# The published /packages/stats/ files as a source (#24). A one-time snapshot: to re-snapshot,
+# run published-crawl (today's date, a new raw/<date>/), published-upload <date>,
+# published-normalise, then `just stats` picks the history up.
+# Land /packages/stats/ and /packages/oldstats/ raw, gzipped, resumable: just published-crawl [--date D]
+published-crawl *args:
+    ./published-stats-mirror.py crawl {{args}}
+
+# Copy a raw snapshot to R2 and check it: just published-upload 2026-10-01
+published-upload date:
+    rclone copy {{published}}/raw/{{date}}/ r2:bioc-access-logs/published-stats/raw/{{date}}/ --exclude '*.partial'
+    rclone check {{published}}/raw/{{date}}/ r2:bioc-access-logs/published-stats/raw/{{date}}/ --exclude '*.partial'
+
+# published_month / published_year Parquet from the latest (or --date) raw snapshot
+published-normalise *args:
+    ./published-stats-mirror.py normalise {{args}}
+
+# Published vs our fixed columns, 2020-01 → 2026-09, to docs/published-comparison.md
+published-compare:
+    ./published-stats-mirror.py compare > docs/published-comparison.md.partial
+    mv docs/published-comparison.md.partial docs/published-comparison.md
+
+# published-stats-mirror.py checks: link discovery, path canonicalisation
+published-self-check:
+    ./published-stats-mirror.py --self-check
