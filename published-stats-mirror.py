@@ -14,9 +14,10 @@
    legacy generator's tree, frozen at its last run) from their index pages, following
    every link that stays inside the tree: category pages, package pages, every .tab, .png,
    .css and .js. The trees are generated HTML, not directory listings, so the HTML is the
-   map. Files land byte for byte under <root>/raw/<date>/<URL path> (a directory URL
-   is its index.html, which the server answers identically), with manifest.jsonl beside
-   them: url, path, status, bytes, sha256, content_type, last_modified, fetched_at. A
+   map. Files land gzipped under <root>/raw/<date>/<URL path>.gz, `zcat` giving the exact
+   bytes received (a directory URL is its index.html, which the server answers
+   identically), with manifest.jsonl beside them: url, path, status, bytes and sha256 (of
+   the uncompressed content), compressed_bytes, content_type, last_modified, fetched_at. A
    status other than 200 is recorded, body not kept (a missing path answers 308 to
    master.bioconductor.org). Network errors are retried with backoff and, if they
    persist, left out of the manifest so a rerun retries them: rerunning with the same
@@ -36,7 +37,7 @@ Re-snapshot: `just published-crawl` (today's date), then upload and normalise. R
 snapshots are never edited; a new date is a new directory.
 """
 
-import argparse, concurrent.futures as cf, datetime as dt, hashlib, json, pathlib, re, sys, time
+import argparse, concurrent.futures as cf, datetime as dt, gzip, hashlib, json, pathlib, re, sys, time
 import urllib.error, urllib.parse, urllib.request
 
 ROOT = pathlib.Path("/data/davsean/bioc-published-stats")
@@ -107,16 +108,27 @@ def land(snap, path):
     row = {"url": SITE + path, "path": path.lstrip("/"), "status": status,
            "bytes": len(body) if status == 200 else None,
            "sha256": hashlib.sha256(body).hexdigest() if status == 200 else None,
+           "compressed_bytes": None,
            "content_type": headers.get("Content-Type"), "last_modified": headers.get("Last-Modified"),
            "location": headers.get("Location"),
            "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
     if status == 200:
-        f = snap / row["path"]
-        f.parent.mkdir(parents=True, exist_ok=True)
-        tmp = f.with_name(f.name + ".partial")
-        tmp.write_bytes(body)
-        tmp.replace(f)
+        row["compressed_bytes"] = write_gz(snap / row["path"], body)
     return row
+
+
+def write_gz(f, body):
+    """<f>.gz holding body (mtime 0: the same bytes gzip the same); its size."""
+    gz = f.with_name(f.name + ".gz")
+    gz.parent.mkdir(parents=True, exist_ok=True)
+    tmp = gz.with_name(gz.name + ".partial")
+    tmp.write_bytes(z := gzip.compress(body, mtime=0))
+    tmp.replace(gz)
+    return len(z)
+
+
+def read_gz(snap, path):
+    return gzip.decompress((snap / (path + ".gz")).read_bytes())
 
 
 def is_html(row):
@@ -145,7 +157,7 @@ def crawl(root, date):
                 if p in done:
                     r = done[p]
                     if is_html(r):
-                        new = [q for q in links(p, (snap / r["path"]).read_bytes()) if q not in seen]
+                        new = [q for q in links(p, read_gz(snap, r["path"])) if q not in seen]
                         seen.update(new)
                         todo += new
                     continue
@@ -164,7 +176,7 @@ def crawl(root, date):
                 done[p] = r
                 fetched += 1
                 if is_html(r):
-                    new = [q for q in links(p, (snap / r["path"]).read_bytes()) if q not in seen]
+                    new = [q for q in links(p, read_gz(snap, r["path"])) if q not in seen]
                     seen.update(new)
                     todo += new
                 if r["status"] in (301, 302, 307, 308) and r["location"]:
@@ -181,7 +193,8 @@ def crawl(root, date):
     by_status = {}
     for r in rows:
         by_status[r["status"]] = by_status.get(r["status"], 0) + 1
-    print(f"snapshot {snap}: {len(ok):,d} files, {sum(r['bytes'] for r in ok):,d} bytes; "
+    print(f"snapshot {snap}: {len(ok):,d} files, {sum(r['bytes'] for r in ok):,d} bytes "
+          f"({sum(r['compressed_bytes'] for r in ok):,d} gzipped); "
           f"statuses {by_status}; fetched {fetched:,d} this run in {time.time() - t0:.0f}s", flush=True)
     for t in TREES:
         tr = [r for r in ok if ("/" + r["path"]).startswith(t)]
@@ -190,6 +203,365 @@ def crawl(root, date):
         print(f"{len(failed)} paths failed after {TRIES} tries (rerun to retry):", *failed[:20],
               sep="\n  ", file=sys.stderr)
         return 1
+
+
+# --- 2. normalise ----------------------------------------------------------------------
+
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+# A .tab path -> kind; tree, category, package (dir), stem: the file name before _stats.tab.
+# RE2 has no backreferences, so `stem` is checked against the package or prefix in SQL.
+TAB_KINDS = """
+    CASE WHEN regexp_matches(path, '^packages/[^/]+/[^/]+/[^/]+/[^/]+_stats\\.tab$') THEN 'package'
+         WHEN regexp_matches(path, '^packages/[^/]+/[^/]+/[^/]+_pkg_stats\\.tab$') THEN 'pkg_stats'
+         WHEN regexp_matches(path, '^packages/[^/]+/[^/]+/[^/]+_pkg_scores\\.tab$') THEN 'pkg_scores'
+         WHEN regexp_matches(path, '^packages/[^/]+/[^/]+/[^/]+_stats\\.tab$') THEN 'category' END"""
+
+
+def connect():
+    import duckdb
+    con = duckdb.connect()
+    tmp = SCRATCH / "duckdb-published-stats"
+    tmp.mkdir(parents=True, exist_ok=True)
+    # ponytail: fixed caps for a shared, busy host.
+    con.execute(f"SET temp_directory = '{tmp}'; SET memory_limit = '32GB'; SET threads = 16")
+    return con
+
+
+def load_tabs(con, snap):
+    """tabs: one row per .tab in the manifest, classified; rows: every data row of the
+    year and all-years files, with its file's line count for the no-drop check."""
+    con.execute(f"""
+        CREATE OR REPLACE TABLE tabs AS
+        SELECT path, fetched_at::TIMESTAMPTZ AS fetched_at, {TAB_KINDS} AS kind,
+               split_part(path, '/', 2) AS tree, split_part(path, '/', 3) AS category,
+               CASE WHEN len(string_split(path, '/')) = 5 THEN split_part(path, '/', 4) END AS package,
+               regexp_extract(path, '([^/]+)_stats\\.tab$', 1) AS stem
+        FROM read_json('{snap}/manifest.jsonl', format = 'newline_delimited')
+        WHERE status = 200 AND path LIKE '%.tab'""")
+    bad = con.execute("SELECT path FROM tabs WHERE kind IS NULL").fetchall()
+    if bad:
+        raise SystemExit(f"{len(bad)} .tab files of no known kind, e.g. {bad[:5]}")
+    # stem is <name>_<YYYY> or <name>; <name> is the package dir, or the category prefix.
+    con.execute(f"""
+        CREATE OR REPLACE TABLE tabs AS
+        SELECT *, CASE WHEN regexp_matches(stem, '_[0-9]{{4}}$') THEN right(stem, 4)::INT END AS file_year,
+               CASE WHEN regexp_matches(stem, '_[0-9]{{4}}$') THEN stem[:-6] ELSE stem END AS name
+        FROM tabs""")
+    prefixes = ", ".join(f"('{c}', '{p}')" for c, p in PREFIXES.items())
+    bad = con.execute(f"""
+        SELECT path FROM tabs LEFT JOIN (VALUES {prefixes}) v(category, prefix) USING (category)
+        WHERE (kind = 'package' AND name <> package)
+           OR (kind = 'category' AND name IS DISTINCT FROM prefix)""").fetchall()
+    if bad:
+        raise SystemExit(f"{len(bad)} .tab names not matching their directory, e.g. {bad[:5]}")
+
+    paths = [p for (p,) in con.execute(
+        "SELECT path FROM tabs WHERE kind IN ('package', 'category') ORDER BY path").fetchall()]
+    n = len(snap.as_posix()) + 1
+    con.execute(f"""
+        CREATE OR REPLACE TABLE rows AS
+        SELECT filename[{n + 1}:-4] AS path, Year AS year_text, Month AS month_text,
+               Nb_of_distinct_IPs AS distinct_ips, Nb_of_downloads AS downloads
+        FROM read_csv($files, delim = '\t', header = true, filename = true, quote = '',
+                      columns = {{'Year': 'VARCHAR', 'Month': 'VARCHAR',
+                                 'Nb_of_distinct_IPs': 'BIGINT', 'Nb_of_downloads': 'BIGINT'}})""",
+                {"files": [f"{snap}/{p}.gz" for p in paths]})
+    # No silent drops: data rows per file = its non-empty lines after the header, counted
+    # here independently of DuckDB's CSV reader.
+    parsed = dict(con.execute("SELECT path, count(*) FROM rows GROUP BY path").fetchall())
+    short = [(p, k, parsed.get(p, 0)) for p in paths
+             if (k := sum(1 for l in read_gz(snap, p).split(b"\n") if l.strip()) - 1) != parsed.get(p, 0)]
+    if short:
+        raise SystemExit(f"{len(short)} files with rows not parsed, e.g. {short[:5]}")
+    months = ", ".join(f"'{m}'" for m in MONTHS)
+    bad = con.execute(f"""
+        SELECT path, year_text, month_text FROM rows
+        WHERE NOT regexp_matches(year_text, '^[0-9]{{4}}$') OR month_text NOT IN ({months}, 'all')
+           OR distinct_ips IS NULL OR downloads IS NULL""").fetchall()
+    if bad:
+        raise SystemExit(f"{len(bad)} rows with an unknown year or month, e.g. {bad[:5]}")
+    con.execute(f"""
+        CREATE OR REPLACE TABLE rows AS
+        SELECT tabs.*, year_text::INT AS year,
+               CASE month_text WHEN 'all' THEN NULL ELSE list_position([{months}], month_text) END AS month,
+               distinct_ips, downloads
+        FROM rows JOIN tabs USING (path)""")
+    return len(paths)
+
+
+def normalise(root, date):
+    snap = root / "raw" / date
+    con = connect()
+    t0 = time.time()
+    n_files = load_tabs(con, snap)
+    print(f"snapshot {date}: parsed {n_files:,d} year and all-years .tab files, "
+          f"{con.execute('SELECT count(*) FROM rows').fetchone()[0]:,d} rows, none dropped  "
+          f"{time.time() - t0:.0f}s", flush=True)
+    for kind, n in con.execute("SELECT kind, count(*) FROM tabs GROUP BY ALL ORDER BY ALL").fetchall():
+        print(f"  {kind}: {n:,d} files")
+
+    # The per-year files are the monthly rows; the all-years files must repeat them.
+    checks = {
+        "year file whose rows are not that year":
+            "SELECT DISTINCT path FROM rows WHERE file_year IS NOT NULL AND year <> file_year",
+        "year file without exactly Jan..Dec + all":
+            """SELECT path FROM rows WHERE file_year IS NOT NULL GROUP BY path
+               HAVING count(*) <> 13 OR count(DISTINCT coalesce(month, 0)) <> 13""",
+        "all-years row differing from or missing in its year file":
+            """SELECT tree, category, package, year, month, distinct_ips, downloads FROM rows WHERE file_year IS NULL
+               EXCEPT ALL
+               SELECT tree, category, package, year, month, distinct_ips, downloads FROM rows WHERE file_year IS NOT NULL""",
+        "year-file row missing in the all-years file":
+            """SELECT tree, category, package, year, month, distinct_ips, downloads FROM rows WHERE file_year IS NOT NULL
+               EXCEPT ALL
+               SELECT tree, category, package, year, month, distinct_ips, downloads FROM rows WHERE file_year IS NULL""",
+    }
+    for what, q in checks.items():
+        n = con.execute(f"SELECT count(*) FROM ({q})").fetchone()[0]
+        print(f"  check: {n:,d} {what}")
+
+    pkg_files = [f"{snap}/{p}.gz" for (p,) in con.execute(
+        "SELECT path FROM tabs WHERE kind = 'pkg_stats' ORDER BY path").fetchall()]
+    if pkg_files:
+        n = len(snap.as_posix()) + 1
+        con.execute(f"""
+            CREATE OR REPLACE TABLE pkg_stats AS
+            SELECT split_part(filename[{n + 1}:], '/', 2) AS tree, split_part(filename[{n + 1}:], '/', 3) AS category,
+                   Package AS package, Year AS year,
+                   CASE Month WHEN 'all' THEN NULL ELSE list_position([{', '.join(repr(m) for m in MONTHS)}], Month) END AS month,
+                   Nb_of_distinct_IPs AS distinct_ips, Nb_of_downloads AS downloads
+            FROM read_csv($files, delim = '\t', header = true, filename = true, quote = '',
+                          columns = {{'Package': 'VARCHAR', 'Year': 'INT', 'Month': 'VARCHAR',
+                                     'Nb_of_distinct_IPs': 'BIGINT', 'Nb_of_downloads': 'BIGINT'}})""",
+                    {"files": pkg_files})
+        cols = "tree, category, package, year, month, distinct_ips, downloads"
+        for what, a, b in (("<p>_pkg_stats.tab row not in a package's year file", "pkg_stats",
+                            "rows WHERE package IS NOT NULL AND file_year IS NOT NULL"),
+                           ("package year-file row not in <p>_pkg_stats.tab",
+                            "rows WHERE package IS NOT NULL AND file_year IS NOT NULL", "pkg_stats")):
+            n = con.execute(f"SELECT count(*) FROM (SELECT {cols} FROM {a} EXCEPT ALL SELECT {cols} FROM {b})").fetchone()[0]
+            print(f"  check: {n:,d} {what}")
+
+    # A (tree, category, package, year) with only an all-years file still counts.
+    pick = """
+        SELECT * FROM rows WHERE file_year IS NOT NULL
+        UNION ALL
+        SELECT * FROM rows r WHERE file_year IS NULL AND NOT EXISTS (
+            SELECT 1 FROM tabs t WHERE t.file_year = r.year AND t.tree = r.tree AND t.category = r.category
+                                   AND t.package IS NOT DISTINCT FROM r.package)"""
+    keys = "tree, category, package, year"
+    for name, cols, where in (("published_month", f"{keys}, month", "month IS NOT NULL"),
+                              ("published_year", keys, "month IS NULL")):
+        out = root / f"{name}.parquet"
+        tmp = out.with_suffix(".parquet.partial")
+        con.execute(f"""
+            COPY (SELECT {cols}, distinct_ips, downloads, 'published' AS source, fetched_at
+                  FROM ({pick}) WHERE {where} ORDER BY {cols} NULLS FIRST)
+            TO '{tmp}' (FORMAT parquet, COMPRESSION zstd)""")
+        tmp.replace(out)
+        print(f"{out}:")
+        for r in con.execute(f"""SELECT tree, package IS NULL, count(*), count(DISTINCT category || '/' || package),
+                                        min(year), max(year) FROM '{out}' GROUP BY ALL ORDER BY ALL""").fetchall():
+            print(f"  {r[0]} {'category totals' if r[1] else 'packages'}: {r[2]:,d} rows"
+                  f"{'' if r[1] else f', {r[3]:,d} packages'}, {r[4]}-{r[5]}")
+
+
+# --- 3. compare ------------------------------------------------------------------------
+
+WINDOW = ("2020-01-01", "2026-09-01")
+
+
+def md(header, rows):
+    def cell(v):
+        return ("–" if v is None else f"{v:+.2f} %" if isinstance(v, float)
+                else f"{v:,d}" if isinstance(v, int) else str(v))
+    return "\n".join(["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+                     + ["| " + " | ".join(cell(v) for v in r) + " |" for r in rows]) + "\n"
+
+
+def fl(v):
+    return None if v is None else float(v)
+
+
+def pct(a, b):
+    return f"round(100.0 * ({a} - {b}) / nullif({b}, 0), 2)"
+
+
+def compare(root, stats):
+    """Markdown on stdout: published (tree 'stats') vs download-stats.py's fixed columns."""
+    con = connect()
+    w0, w1 = WINDOW
+    q = lambda sql: con.execute(sql).fetchall()
+    con.execute(f"""
+        CREATE TABLE pub AS SELECT make_date(year, month, 1) AS month, category, package, distinct_ips, downloads
+        FROM '{root}/published_month.parquet'
+        WHERE tree = 'stats' AND make_date(year, month, 1) BETWEEN '{w0}' AND '{w1}';
+        CREATE TABLE ours AS SELECT month, category, package, distinct_clients, downloads
+        FROM '{stats}/package_month.parquet' WHERE month BETWEEN '{w0}' AND '{w1}'
+        UNION ALL
+        SELECT month, category, NULL, distinct_clients, downloads
+        FROM '{stats}/category_month.parquet' WHERE month BETWEEN '{w0}' AND '{w1}';
+        CREATE TABLE cmp AS
+        SELECT coalesce(p.month, o.month) AS month, coalesce(p.category, o.category) AS category,
+               coalesce(p.package, o.package) AS package, p.distinct_ips AS pub_ips, p.downloads AS pub_dl,
+               coalesce(o.distinct_clients, 0) AS our_ips, coalesce(o.downloads, 0) AS our_dl
+        FROM pub p FULL JOIN ours o ON p.month = o.month AND p.category = o.category
+                                    AND p.package IS NOT DISTINCT FROM o.package
+        WHERE coalesce(p.downloads, 0) > 0 OR coalesce(o.downloads, 0) > 0;
+        UPDATE cmp SET pub_ips = coalesce(pub_ips, 0), pub_dl = coalesce(pub_dl, 0);""")
+    print(f"# Published /packages/stats/ vs our fixed-definition columns, {w0[:7]} → {w1[:7]}\n")
+    print("Published: tree `stats` of the snapshot (`published_month.parquet`). Ours: "
+          "`package_month` / `category_month` `downloads`, `distinct_clients` (download-stats.py). "
+          "Δ = (ours − published) / published.\n")
+
+    print("## Coverage\n")
+    rows = q("""SELECT package IS NULL, count(*), count(*) FILTER (pub_dl > 0 AND our_dl > 0),
+                       count(*) FILTER (our_dl = 0), sum(pub_dl) FILTER (our_dl = 0)::BIGINT,
+                       count(*) FILTER (pub_dl = 0), sum(our_dl) FILTER (pub_dl = 0)::BIGINT
+                FROM cmp GROUP BY 1 ORDER BY 1""")
+    print(md(["rows", "months with downloads", "in both", "published only", "their downloads",
+              "ours only", "their downloads"],
+             [("categories" if r[0] else "package", *r[1:]) for r in rows]))
+
+    print("## Distribution of Δ, package-months in both with ≥ 100 published downloads\n")
+    qs = [1, 5, 25, 50, 75, 95, 99]
+    rows = []
+    for what, a, b in (("downloads", "our_dl", "pub_dl"), ("distinct IPs", "our_ips", "pub_ips")):
+        for cat in ("all", "bioc", "data-annotation", "data-experiment", "workflows"):
+            where = "" if cat == "all" else f"AND category = '{cat}'"
+            r = q(f"""SELECT count(*), {', '.join(f'quantile_cont(d, {p / 100})' for p in qs)},
+                             avg((abs(d) <= 1)::INT) * 100, avg((abs(d) <= 5)::INT) * 100
+                      FROM (SELECT {pct(a, b)} AS d FROM cmp
+                            WHERE package IS NOT NULL AND pub_dl >= 100 AND our_dl > 0 {where})""")[0]
+            if r[0]:
+                rows.append((what, cat, r[0], *map(float, r[1:8]), f"{r[8]:.1f} %", f"{r[9]:.1f} %"))
+    print(md(["measure", "category", "n", *[f"p{p}" for p in qs], "within ±1 %", "within ±5 %"], rows))
+
+    print("## Category totals by month, where |Δ| > 2 %\n")
+    rows = q(f"""SELECT strftime(month, '%Y-%m'), category, pub_dl, our_dl, {pct('our_dl', 'pub_dl')},
+                        pub_ips, our_ips, {pct('our_ips', 'pub_ips')}
+                 FROM cmp WHERE package IS NULL
+                   AND (abs({pct('our_dl', 'pub_dl')}) > 2 OR abs({pct('our_ips', 'pub_ips')}) > 2)
+                 ORDER BY month, category""")
+    n = q("SELECT count(*) FROM cmp WHERE package IS NULL")[0][0]
+    print(f"{len(rows)} of {n} category-months.\n")
+    print(md(["month", "category", "pub downloads", "our downloads", "Δ", "pub IPs", "our IPs", "Δ"],
+             [(*r[:4], fl(r[4]), r[5], r[6], fl(r[7])) for r in rows]))
+
+    print("## Outlier package-months (|Δ downloads| > 5 %, ≥ 1,000 published downloads), by month\n")
+    rows = q(f"""SELECT strftime(month, '%Y-%m'), count(*), count(*) FILTER (our_dl > pub_dl),
+                        count(*) FILTER (abs({pct('our_ips', 'pub_ips')}) > 5),
+                        (SELECT count(*) FROM cmp c WHERE c.month = cmp.month AND c.package IS NOT NULL
+                                                   AND c.pub_dl >= 1000)
+                 FROM cmp WHERE package IS NOT NULL AND pub_dl >= 1000
+                   AND abs({pct('our_dl', 'pub_dl')}) > 5 GROUP BY month ORDER BY month""")
+    print(md(["month", "outliers", "ours higher", "of which |Δ IPs| > 5 %", "package-months ≥ 1,000"], rows))
+    print("Largest 25 by |Δ downloads|:\n")
+    rows = q(f"""SELECT strftime(month, '%Y-%m'), category, package, pub_dl, our_dl, {pct('our_dl', 'pub_dl')},
+                        pub_ips, our_ips, {pct('our_ips', 'pub_ips')}
+                 FROM cmp WHERE package IS NOT NULL AND pub_dl >= 1000
+                 ORDER BY abs(our_dl - pub_dl) DESC LIMIT 25""")
+    print(md(["month", "category", "package", "pub downloads", "our downloads", "Δ", "pub IPs", "our IPs", "Δ"],
+             [(*r[:5], fl(r[5]), r[6], r[7], fl(r[8])) for r in rows]))
+
+    missing_days(con, stats, q)
+    cross_category(con, stats, q)
+
+
+def universe(con, stats):
+    con.execute(f"""
+        CREATE OR REPLACE TABLE universe AS
+        SELECT DISTINCT regexp_extract(filename, '-((bioc|data-annotation|data-experiment|workflows))\\.txt$', 1)
+                        AS category, unnest(string_split(content, chr(10))) AS package
+        FROM read_text('{stats}/packages-index/*.txt')""")
+
+
+def missing_days(con, stats, q):
+    """Is a month where ours is higher on both counts the published source missing days?
+    Fit one run of missing days per month to the four category download totals, then
+    test it on distinct IPs, which a day-sum cannot fake: recount over the kept days."""
+    universe(con, stats)
+    suspects = [r[0] for r in q(f"""
+        SELECT month FROM cmp WHERE package IS NULL AND category = 'bioc'
+          AND {pct('our_dl', 'pub_dl')} > 2 AND {pct('our_ips', 'pub_ips')} > 2 ORDER BY month""")]
+    print("## Hypothesis: the published source is missing log days\n")
+    print(f"Months where bioc is > 2 % higher in ours on both downloads and IPs: "
+          f"{', '.join(m.strftime('%Y-%m') for m in suspects) or 'none'}. For each, the run of whole "
+          "UTC days [a, b] whose removal best fits the published download totals of all four "
+          "categories, then distinct IPs recounted over the remaining days.\n")
+    rows = []
+    for m in suspects:
+        con.execute(f"""
+            CREATE OR REPLACE TABLE days AS
+            SELECT date, category, package, client_id, downloads
+            FROM read_parquet('{stats}/clients/year={m.year}/month={m.month}/clients.parquet')
+            SEMI JOIN universe USING (category, package)""")
+        fit = q(f"""
+            WITH d AS (SELECT day(date) AS d, category, sum(downloads) AS n FROM days GROUP BY ALL),
+            gaps AS (SELECT a, b FROM range(1, 32) r(a), range(1, 32) s(b) WHERE a <= b
+                     UNION ALL SELECT 0, -1),
+            kept AS (SELECT a, b, category, sum(n) FILTER (d < a OR d > b) AS n FROM gaps, d GROUP BY ALL)
+            SELECT a, b, sum(abs(k.n - p.pub_dl) / p.pub_dl) AS err
+            FROM kept k JOIN cmp p ON p.month = DATE '{m}' AND p.package IS NULL AND p.category = k.category
+            GROUP BY a, b ORDER BY err LIMIT 1""")[0]
+        a, b, _ = fit
+        gap = "none" if a == 0 else f"{m:%Y-%m}-{a:02d} → {b:02d}"
+        for r in q(f"""
+            WITH k AS (SELECT category, sum(downloads) AS dl, count(DISTINCT client_id) AS ips FROM days
+                       WHERE NOT day(date) BETWEEN {a} AND {b} GROUP BY ALL)
+            SELECT category, pub_dl, our_dl, k.dl, {pct('k.dl', 'pub_dl')}, pub_ips, our_ips, k.ips,
+                   {pct('k.ips', 'pub_ips')}
+            FROM k JOIN cmp USING (category) WHERE month = DATE '{m}' AND package IS NULL
+            ORDER BY category"""):
+            rows.append((f"{m:%Y-%m}", gap, *r[:4], fl(r[4]), *r[5:8], fl(r[8])))
+        # The same gap, package by package (top 20 bioc by published downloads).
+        r = q(f"""
+            WITH k AS (SELECT category, package, sum(downloads) AS dl, count(DISTINCT client_id) AS ips
+                       FROM days WHERE NOT day(date) BETWEEN {a} AND {b} GROUP BY ALL),
+            top AS (SELECT * FROM cmp WHERE month = DATE '{m}' AND category = 'bioc' AND package IS NOT NULL
+                    ORDER BY pub_dl DESC LIMIT 20)
+            SELECT median(abs({pct('k.dl', 'pub_dl')})), median(abs({pct('k.ips', 'pub_ips')})),
+                   median(abs({pct('our_dl', 'pub_dl')})), median(abs({pct('our_ips', 'pub_ips')}))
+            FROM top JOIN k USING (category, package)""")[0]
+        rows.append((f"{m:%Y-%m}", gap, "top 20 bioc packages, median \\|Δ\\|", "", f"{r[2]:.2f} %", "",
+                     f"{r[0]:.2f} %", "", f"{r[3]:.2f} %", "", f"{r[1]:.2f} %"))
+    print(md(["month", "best-fit missing days", "category", "pub downloads", "ours", "ours, gap removed", "Δ",
+              "pub IPs", "ours", "ours, gap removed", "Δ"], rows))
+
+
+def cross_category(con, stats, q):
+    """Does the published file for (category, package) count the package's downloads
+    under every category path? Only package-months with material cross-category traffic
+    (all-paths downloads > own-path by > 2 %) can tell the two rules apart."""
+    con.execute(f"""
+        CREATE OR REPLACE TABLE anycat AS
+        SELECT make_date(year, month, 1) AS month, package, sum(downloads) AS dl,
+               count(DISTINCT client_id) AS ips
+        FROM read_parquet('{stats}/clients/*/*/clients.parquet', hive_partitioning = true)
+        WHERE make_date(year, month, 1) BETWEEN '{WINDOW[0]}' AND '{WINDOW[1]}'
+        GROUP BY ALL""")
+    con.execute(f"""
+        CREATE OR REPLACE TABLE xcat AS
+        SELECT c.*, a.dl AS any_dl, a.ips AS any_ips,
+               CASE WHEN abs(our_dl - pub_dl) <= 0.02 * pub_dl THEN 'own path'
+                    WHEN abs(a.dl - pub_dl) <= 0.02 * pub_dl THEN 'all paths'
+                    ELSE 'neither' END AS rule
+        FROM cmp c JOIN anycat a USING (month, package)
+        WHERE c.package IS NOT NULL AND pub_dl >= 100 AND a.dl > 1.02 * our_dl""")
+    print("## Hypothesis: the published files count a package under every category path\n")
+    print("Package-months with ≥ 100 published downloads whose downloads over all category "
+          "paths exceed the own-path count by > 2 %, classified by which matches the published "
+          "downloads within 2 %. By year and category:\n")
+    rows = q("""SELECT year(month)::VARCHAR, category, count(*), count(*) FILTER (rule = 'own path'),
+                       count(*) FILTER (rule = 'all paths'), count(*) FILTER (rule = 'neither')
+                FROM xcat GROUP BY ALL ORDER BY ALL""")
+    print(md(["year", "category", "package-months", "own path", "all paths", "neither"], rows))
+    print("Months where 'all paths' wins most often:\n")
+    rows = q("""SELECT strftime(month, '%Y-%m'), count(*), count(*) FILTER (rule = 'own path'),
+                       count(*) FILTER (rule = 'all paths'), count(*) FILTER (rule = 'neither')
+                FROM xcat GROUP BY month HAVING count(*) FILTER (rule = 'all paths') > 0
+                ORDER BY count(*) FILTER (rule = 'all paths') DESC, month LIMIT 15""")
+    print(md(["month", "package-months", "own path", "all paths", "neither"], rows))
 
 
 def latest(root):
@@ -204,12 +576,17 @@ def main():
     ap.add_argument("step", nargs="?", choices=["crawl", "normalise", "compare"])
     ap.add_argument("--root", default=ROOT, type=pathlib.Path, help=f"default {ROOT}")
     ap.add_argument("--date", help="snapshot date (crawl: default today UTC; else the latest)")
+    ap.add_argument("--stats", default=STATS, type=pathlib.Path, help=f"download-stats.py --out, default {STATS}")
     ap.add_argument("--self-check", action="store_true")
     a = ap.parse_args()
     if a.self_check:
         return self_check()
     if a.step == "crawl":
         return crawl(a.root, a.date or dt.datetime.now(dt.timezone.utc).date().isoformat())
+    if a.step == "normalise":
+        return normalise(a.root, a.date or latest(a.root))
+    if a.step == "compare":
+        return compare(a.root, a.stats)
     ap.error("a step is required")
 
 
