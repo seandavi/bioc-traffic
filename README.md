@@ -1,62 +1,87 @@
 # bioc-traffic
 
-Everything downstream of the Logpush delivery of Bioconductor access logs. The producer — the
-Worker's per-request access record — lives in `bioc-edge`; the record is the contract across
-that seam. This repo is private: it names buckets, job IDs and secrets.
+Access-log analytics for [bioconductor.org](https://bioconductor.org): who downloads which
+packages, how traffic splits between people, package clients, mirrors and crawlers, and how
+both have changed since 2020.
 
-| Piece | What |
+bioconductor.org moved from AWS CloudFront to a Cloudflare Worker on 2026-09-28. This repo
+treats the two eras as one dataset: about 7.5 billion CloudFront requests from 2020-01-01
+through the cutover, and the Worker's per-request records since. Requests run around 6
+million a day on the Worker as of late September 2026.
+
+## Where it sits
+
+```
+bioc-edge (Worker)  ──Logpush──▶  raw records  ──▶  hourly Parquet  ──▶  access view (both eras)
+                                                                            │
+                         CloudFront logs (2020 → cutover) ──▶ monthly Parquet ┘
+                                                                            │
+                                    ┌───────────────────────────────────────┤
+                                    ▼                                       ▼
+                           package download stats                 dashboard rollups
+                     (fixed + human/automated columns)    (minute / hour / day, by class,
+                                                          status, country, page, package…)
+```
+
+- **The producer is [`bioc-edge`](https://github.com/seandavi/bioc-edge).** Its Worker writes
+  one access record per request, using CloudFront's field names so the eras line up. That
+  record is the contract between the two repos.
+- **This repo owns everything after delivery:** the delivery gap check, conversion to
+  Parquet, the unified view, traffic classification, and the aggregates.
+- **Raw records are never edited** ([ADR 0002](https://github.com/seandavi/bioc-infrastructure/blob/main/adr/0002-mirror-access-logs-unfiltered.md)).
+  Everything else is derived and can be rebuilt from them.
+- **Outputs are static files**, regenerated on timers, not a live query service
+  ([ADR 0004](https://github.com/seandavi/bioc-infrastructure/blob/main/adr/0004-download-statistics-are-generated-static-files.md)).
+- How this fits with the package registry and the research-intelligence work:
+  [bioc-infrastructure#67](https://github.com/seandavi/bioc-infrastructure/issues/67).
+
+## Privacy
+
+The logs carry client IP addresses, and they stay private. Everything published from here is
+an aggregate.
+
+- **Raw addresses are kept, hashed in views** ([ADR 0012](https://github.com/seandavi/bioc-infrastructure/blob/main/adr/0012-client-addresses-are-stored-raw-and-hashed-in-views.md)):
+  `client_id = sha256(salt || c_ip)` with a secret salt, the same in both eras, so distinct
+  clients can be counted across the cutover. The test vector is in `cloudflare-logs-to-parquet.py --self-check`.
+- **Nothing leaves this pipeline with an address in it.** Aggregates carry counts of
+  `client_id`s, never `c_ip`.
+- No log data is in this repository.
+
+## What's here
+
+| Piece | What it does |
 |---|---|
-| `ANALYTICS.md` | What exists, where, and how to query it. Start here. |
-| `check-logpush.sh` + `systemd/` | Daily gap alarm on yesterday's delivery (ADR 0003): every UTC hour present, plus a minimum object count. `./check-logpush.sh 20260928` checks any day. Timer is installed on onclappc02. |
-| `cloudfront-logs-to-parquet.py` | The one-shot CloudFront-era mirror to Parquet, with `--verify`. |
-| `cloudflare-logs-to-parquet.py` + `justfile` | Logpush records → hourly Parquet (local, then R2), with `--verify` (#8). `just --list`. |
-| `sql/access.sql` | DuckDB `access` view: both eras, `era` and `client_id` columns. `just duckdb` (also loads `client_class.sql` and `downloads.sql`). |
-| `sql/cloudflare_access.bq.sql` | The old BigQuery normalising view, kept for reference; BigQuery is no longer used (#7). |
-| `download-stats.py` + `sql/downloads.sql` | Package download stats across both eras (#11): monthly client partitions, Parquet aggregates with fixed and human/automated columns, the `/packages/stats/` tree (ADR 0004). `just stats`; see `ANALYTICS.md`. |
-| `sql/rollup_tier.sql`, `sql/rollup_overall.sql` | Dashboard rollups (#10): minute/6 h, hour/30 d, day/90 d by class, status, country, UA family, page, referrer, cache, package and `bioc_version`; plus the forever per-day overall series, both eras. Static Parquet + JSON in `$BIOC_ROLLUPS` (default `/data/davsean/bioc-traffic-rollups`), then R2 `rollups/`. `just rollup minute\|hour\|day`. |
-| `sql/client_class.sql` | `client_class_v0(...)`: per-request traffic class for both eras (#5), DuckDB macros. Check: `duckdb -c ".read sql/client_class.sql" -c ".read sql/client_class_check.sql"`. |
+| `cloudflare-logs-to-parquet.py` | Worker records → one Parquet file per UTC hour, with `--verify` (raw count = Parquet count). Every 15 min, plus a nightly re-seal for late records. |
+| `cloudfront-logs-to-parquet.py` | CloudFront logs → one Parquet file per month, with `--verify`. Also holds the published download definition. |
+| `sql/access.sql` | The `access` view: both eras, one schema, with `era`, `client_id` and a `production` flag. |
+| `sql/client_class.sql` | `client_class_v0`: versioned, rule-based traffic classes (human browser, package client, mirror, CI, search crawler, AI crawler, likely automated…). Check: `sql/client_class_check.sql`. |
+| `download-stats.py`, `sql/downloads.sql` | Package downloads by package, release and category, 2020 →. Fixed-definition columns that match the published `/packages/stats/` figures, plus human / package-client / automated columns labelled with the classifier version. Regenerates the `/packages/stats/` file tree. |
+| `sql/rollup_*.sql` | Dashboard rollups, incremental: minute (6 h), hour (30 d), day (90 d), and a daily overall series back to 2020. |
+| `check-logpush.sh` | Daily alarm if any UTC hour of yesterday's delivery is missing. Logpush can't backfill, so a missed gap is permanent loss. |
+| `systemd/` | The timers that run all of the above. |
+| `justfile` | Common invocations: `just --list`. |
 
-Decisions are cross-repo and live in `bioc-infrastructure/adr` — 0002 (mirror unfiltered),
-0003 (logging after the cutover), 0004 (stats are static files), 0012 (raw addresses, hashed in
-views).
+## Two things worth knowing about the numbers
 
-## Install the timers
+- **Download counts and "who downloads" are separate questions.** The fixed columns count
+  requests the same way the published statistics always have. The human/automated columns
+  are an interpretation, versioned, and will change as the classifier improves.
+- **The human/automated split jumps at the cutover** for a classifier reason, not a traffic
+  one: only the Cloudflare era has network (ASN) and verified-bot information. The fixed
+  columns run straight across it.
 
-```bash
-ln -sf "$PWD"/systemd/bioc-logpush-check{,-stale}.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now bioc-logpush-check.timer
-# Seed the dead-man stamp before arming its timer, or it alerts at the next noon.
-systemctl --user start bioc-logpush-check.service
-systemctl --user enable --now bioc-logpush-check-stale.timer
-```
+## Running it
 
-`bioc-logpush-check-stale` is the dead-man: it fails if the check has not passed in 36h
-(`~/.local/state/bioc-logpush-check.ok`), whether the timer stopped or the check keeps failing.
-`LOGPUSH_PREFIX` takes `gs://…` (gcloud) or an rclone `remote:path` such as `r2:…`.
+It runs on one host with DuckDB, `uv` and `rclone`. It needs credentials for the log buckets
+and the salt, which aren't public. Operator specifics (buckets, job IDs, measurements, the
+timer install steps) are in `ANALYTICS.local.md`, which is not in the repository.
 
-The Parquet timers (every 15 min: current and previous UTC hour; 08:00 UTC: re-seal
-yesterday) are installed on onclappc02:
+## Status
 
-```bash
-ln -sf "$PWD"/systemd/bioc-cloudflare-parquet{,-reseal}.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now bioc-cloudflare-parquet.timer bioc-cloudflare-parquet-reseal.timer
-```
+Working: hourly conversion, gap check, unified view, package stats, rollups. Next: network
+and geolocation lookups for the CloudFront era, so classification is comparable across the
+cutover ([#4](../../issues/4)), and a public traffic dashboard built from the rollups ([#6](../../issues/6)).
 
-The daily download-stats timer (09:30 UTC, after the re-seal) is **not installed yet**:
+## License
 
-```bash
-ln -sf "$PWD"/systemd/bioc-download-stats.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now bioc-download-stats.timer
-```
-
-The rollup timers (minute tier every 15 min, ~3 s; hour tier hourly, ~25 min; day tier and the
-overall series at 10:30 UTC, ~50 min) are **not installed yet**:
-
-```bash
-ln -sf "$PWD"/systemd/bioc-rollup-{minute,hour,day}.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now bioc-rollup-minute.timer bioc-rollup-hour.timer bioc-rollup-day.timer
-```
-
-`bioc-notify@.service` is shared with the sync timers and is installed from `bioc-edge`.
+[Apache 2.0](LICENSE).

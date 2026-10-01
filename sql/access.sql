@@ -18,7 +18,7 @@
 -- first (`just duckdb` does), or anything that touches client_id errors out:
 --   SET VARIABLE ip_salt = '<bioc-logs-ip-salt: its 64-char hex text, newline trimmed>';
 --
--- Filter on year/month: they are the Hive partitions of both mirrors (ANALYTICS.md,
+-- Filter on year/month: they are the Hive partitions of both mirrors (ANALYTICS.local.md,
 -- "Benchmarking traps"). The eras differ in how they say "missing": CloudFront logs '-',
 -- the Worker logs NULL. Left as logged, as in the BigQuery view.
 
