@@ -37,7 +37,7 @@ Re-snapshot: `just published-crawl` (today's date), then upload and normalise. R
 snapshots are never edited; a new date is a new directory.
 """
 
-import argparse, concurrent.futures as cf, datetime as dt, gzip, hashlib, json, pathlib, re, sys, time
+import argparse, collections, concurrent.futures as cf, datetime as dt, gzip, hashlib, json, pathlib, re, sys, time
 import urllib.error, urllib.parse, urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -147,9 +147,18 @@ def crawl(root, date):
             done["/" + r["path"]] = r
     t0, fetched, failed = time.time(), 0, []
     # Resume: paths already in the manifest are walked again from the landed HTML, so their
-    # links are rediscovered; only paths not in it are fetched.
-    todo = [canonical(t) for t in TREES] + SEEDS
-    seen = set(todo)
+    # links are rediscovered; only paths not in it are fetched. todo is a stack with
+    # /packages/stats/ on top: it is the tree the later steps read.
+    todo = collections.deque()
+    seen = set()
+
+    def push(paths):
+        for q in paths:
+            if q not in seen:
+                seen.add(q)
+                todo.append(q) if q.startswith(TREES[0]) else todo.appendleft(q)
+
+    push([canonical(t) for t in TREES] + SEEDS)
     with manifest.open("a") as out, cf.ThreadPoolExecutor(WORKERS) as pool:
         running = {}
         while todo or running:
@@ -158,9 +167,7 @@ def crawl(root, date):
                 if p in done:
                     r = done[p]
                     if is_html(r):
-                        new = [q for q in links(p, read_gz(snap, r["path"])) if q not in seen]
-                        seen.update(new)
-                        todo += new
+                        push(links(p, read_gz(snap, r["path"])))
                     continue
                 running[pool.submit(land, snap, p)] = p
             if not running:
@@ -177,15 +184,12 @@ def crawl(root, date):
                 done[p] = r
                 fetched += 1
                 if is_html(r):
-                    new = [q for q in links(p, read_gz(snap, r["path"])) if q not in seen]
-                    seen.update(new)
-                    todo += new
+                    push(links(p, read_gz(snap, r["path"])))
                 if r["status"] in (301, 302, 307, 308) and r["location"]:
                     u = urllib.parse.urlsplit(urllib.parse.urljoin(SITE + p, r["location"]))
                     q = canonical(u.path) if u.netloc == "bioconductor.org" else None
-                    if q and q not in seen:
-                        seen.add(q)
-                        todo.append(q)
+                    if q:
+                        push([q])
                 if fetched % 2000 == 0:
                     print(f"  {fetched:,d} fetched, {len(todo) + len(running):,d} queued  "
                           f"{time.time() - t0:.0f}s", flush=True)
@@ -568,7 +572,7 @@ def head_requests(con, q):
         GROUP BY ALL""")
     con.execute("""
         CREATE OR REPLACE TABLE cmp_head AS
-        SELECT c.*, coalesce(h.h200, 0) AS h200, strftime(month, '%Y-') || (CASE WHEN month(month) <= 6
+        SELECT c.*, coalesce(h.h200, 0) AS h200, strftime(c.month, '%Y-') || (CASE WHEN month(c.month) <= 6
                THEN 'H1' ELSE 'H2' END) AS half
         FROM cmp c LEFT JOIN (FROM head UNION ALL
                               SELECT month, category, NULL, sum(h200) FROM head GROUP BY ALL) h
@@ -588,6 +592,20 @@ def head_requests(con, q):
         FROM cmp_head GROUP BY half ORDER BY half""")
     print(md(["half-year", "bioc total, median Δ", "+HEAD", "package-months", "median |Δ|", "+HEAD"],
              [(r[0], fl(r[1]), fl(r[2]), r[3], f"{r[4]:.2f} %", f"{r[5]:.2f} %") for r in rows]))
+    # Which rule fits each month better (median |Δ| over its package-months), as runs of months.
+    runs = []
+    for m, with_head, a, b in q(f"""
+            SELECT month, b < a, a, b FROM (
+                SELECT month, median(abs({pct('our_dl', 'pub_dl')})) AS a, median(abs({pct('our_dl + h200', 'pub_dl')})) AS b
+                FROM cmp_head WHERE package IS NOT NULL AND pub_dl >= 100 AND our_dl > 0 GROUP BY month)
+            ORDER BY month"""):
+        if runs and runs[-1][2] == with_head:
+            runs[-1][1:] = [m, with_head, runs[-1][3] + 1]
+        else:
+            runs.append([m, m, with_head, 1])
+    print("Month by month, the rule with the smaller median |Δ| over package-months:\n")
+    print(md(["from", "to", "fits better", "months"],
+             [(f"{a:%Y-%m}", f"{b:%Y-%m}", "with HEAD" if h else "without HEAD", n) for a, b, h, n in runs]))
     print("Category-months with |Δ downloads| > 2 %:\n")
     rows = q(f"""
         SELECT strftime(month, '%Y-%m'), category, pub_dl, our_dl, h200, {pct('our_dl', 'pub_dl')},
