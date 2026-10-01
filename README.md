@@ -11,7 +11,7 @@ that seam. This repo is private: it names buckets, job IDs and secrets.
 | `cloudfront-logs-to-parquet.py` | The one-shot CloudFront-era mirror to Parquet, with `--verify`. |
 | `cloudflare-logs-to-parquet.py` + `justfile` | Logpush records → hourly Parquet (local, then R2), with `--verify` (#8). `just --list`. |
 | `sql/access.sql` | DuckDB `access` view: both eras, `era` and `client_id` columns. `just duckdb` (also loads `client_class.sql` and `downloads.sql`). |
-| `sql/cloudflare_access.bq.sql` | The BigQuery normalising view, as extracted with `bq show`. |
+| `sql/cloudflare_access.bq.sql` | The old BigQuery normalising view, kept for reference; BigQuery is no longer used (#7). |
 | `download-stats.py` + `sql/downloads.sql` | Package download stats across both eras (#11): monthly client partitions, Parquet aggregates with fixed and human/automated columns, the `/packages/stats/` tree (ADR 0004). `just stats`; see `ANALYTICS.md`. |
 | `sql/rollup_tier.sql`, `sql/rollup_overall.sql` | Dashboard rollups (#10): minute/6 h, hour/30 d, day/90 d by class, status, country, UA family, page, referrer, cache, package and `bioc_version`; plus the forever per-day overall series, both eras. Static Parquet + JSON in `$BIOC_ROLLUPS` (default `/data/davsean/bioc-traffic-rollups`), then R2 `rollups/`. `just rollup minute\|hour\|day`. |
 | `sql/client_class.sql` | `client_class_v0(...)`: per-request traffic class for both eras (#5), DuckDB macros. Check: `duckdb -c ".read sql/client_class.sql" -c ".read sql/client_class_check.sql"`. |

@@ -2,26 +2,31 @@
 
 Operational companion to the published download-stats page. **That page is public; this repo is not** —
 it carries internal paths, account-specific URIs and secret names, none of which belong on the
-published site. See `docs/adr/0001-public-docs-site-with-a-publication-boundary.md`.
+published site. See [ADR 0001](https://github.com/seandavi/bioc-infrastructure/blob/main/adr/0001-public-docs-site-with-a-publication-boundary.md).
 
-Design rationale lives in the ADRs: [0002](docs/adr/0002-mirror-access-logs-unfiltered.md)
-(mirror unfiltered, interpret with views), [0004](docs/adr/0004-download-statistics-are-generated-static-files.md)
+Design rationale lives in the ADRs: [0002](https://github.com/seandavi/bioc-infrastructure/blob/main/adr/0002-mirror-access-logs-unfiltered.md)
+(mirror unfiltered, interpret with views), [0004](https://github.com/seandavi/bioc-infrastructure/blob/main/adr/0004-download-statistics-are-generated-static-files.md)
 (databases are build-time infrastructure, not serving infrastructure).
 
 ## What exists
 
+Sizes as of 2026-10-01. Everything here is private: it carries `c_ip` or `client_id`.
+
 | Artifact | Location | Size | Notes |
 |---|---|---|---|
-| Raw CloudFront logs | `/data/davsean/bioc-cf-logs-raw` | 564 GB, 913,579 objects | system of record; back to 2020-01-01 |
-| Parquet mirror (local) | `/data/davsean/bioc-cf-parquet` | 421 GB, 80 files | `year=/month=`, one file per month |
-| Parquet mirror (R2) | `s3://bioc-cloudfront-logs/parquet/` | 420.9 GiB, 80 files | verified, 0 differences |
-| Iceberg table | `biocr2.cloudfront.access_logs` | same bytes | adopted via `add_files`, no copy |
+| Raw CloudFront logs | `/data/davsean/bioc-cf-logs-raw` (from S3 `aws-bioc:bioc-cloudfront-logs`) | 599 GB | system of record; 2020-01-01 → the cutover tail (#15) |
+| CloudFront Parquet (local) | `/data/davsean/bioc-cf-parquet` | 448 GB, 81 files | `year=/month=`, one file per month, through 2026-09 |
+| CloudFront Parquet (R2) | `r2:bioc-cloudfront-logs/parquet/` | same 81 files | 2026-08/09 re-uploaded 2026-09-30, `rclone check` clean |
+| Iceberg table | `biocr2.cloudfront.access_logs` | metadata only | **stale for 2026-08** (file replaced under it, #15) |
+| Raw Logpush records | `gs://bioc-u24-logs/cloudflare/bioc-access-logs/{DATE}/` | ~16 GB/day decompressed | system of record for the Cloudflare era (below) |
+| Cloudflare Parquet (local) | `/data/davsean/bioc-cloudflare-parquet` | 2.2 GB | `year=/month=/day=/hour=`, one file per UTC hour, from 2026-08-06 |
+| Cloudflare Parquet (R2) | `r2:bioc-access-logs/parquet/cloudflare/` | same | canonical copy of the derived Parquet |
+| Package download stats | `/data/davsean/bioc-traffic-stats` | 7.3 GB | [Package download stats](#package-download-stats-11) |
+| Dashboard rollups | `/data/davsean/bioc-traffic-rollups`, copied to `r2:bioc-access-logs/rollups/` | 10 MB | [Dashboard rollups](#dashboard-rollups-10-19) |
 
-**7,123,972,770 rows**, 33 CloudFront W3C fields, every row, no filtering. All 80 months
-reconcile against source (`--verify`).
-
-The Iceberg table is *metadata over the same Parquet objects* — not a second copy. Deleting the
-Parquet would empty the table.
+CloudFront: **7,501,032,064 rows**, 33 W3C fields, every row, no filtering; every month
+reconciles against source (`--verify`). The Iceberg table is *metadata over the same Parquet
+objects*, not a second copy, and nothing in the DuckDB path reads it.
 
 ## Cloudflare era — logging since the Worker (ADR 0003, amended)
 
@@ -50,7 +55,9 @@ order and types as `cloudfront_raw` (verified), so cross-era queries are a plain
 Unit conversions live there too: `time_taken` ms→seconds, `cs_uri_query` sheds its leading `?`.
 Definition: `bq show --format=prettyjson bioc-u24:logs.cloudflare_access`.
 
-**BigQuery is the query layer**: dataset `bioc-u24:logs`, external tables over the objects
+**BigQuery is not used any more.** Every query over `cf_workers_trace_raw` has failed since
+2026-08-14 (scheduled-event records, #1); DuckDB over the Parquet below replaced it (#7). What
+was there, for the record: dataset `bioc-u24:logs`, external tables over the objects
 in place — `cf_workers_trace_raw` (NDJSON, bioc-access-logs), `icegate_trace_raw` (NDJSON,
 bioc-on-ice), `cloudfront_raw` (Parquet, the historical era). Both eras side by side, e.g.:
 
@@ -76,26 +83,28 @@ that, `client_id` 13%), 45 s from GCS. Query both eras through `sql/access.sql`
   Each hour is therefore built from objects up to 6 h past it, and the 08:00 UTC re-seal of
   yesterday is the final version. The 15-minute run's last hours can be short until then.
   A record later than 6 h is not written, and the run log counts it (`late beyond 6:00:00`).
-- **Coverage.** The CloudFront Parquet ends 2026-08-05 (a partial day, 146k rows). Logpush to
-  GCS starts 2026-08-06T20:19Z. Volume ramps up slowly: 6,212 records on 08-06, and objects
-  per day of 105 (08-15), 579 (09-01) and ~2,600 (from 09-10).
+- **Coverage and the cutover.** Logpush to GCS starts 2026-08-06T20:19Z. Until the
+  2026-09-28 ~20:09Z cutover the Worker served only `bioc-dev.cancerdatasci.org`; production
+  stayed on CloudFront, which still serves a cached-DNS trickle after it. A request is in
+  exactly one era, so `access` has no time cut: filter `production` instead (#15, #16).
 
 Gotchas and state:
 
-- **R2 bucket `bioc-access-logs` is the abandoned pre-switch destination** — it holds only
-  2026-08-06 → 08-07T12:17Z and will never grow again. Do not read its staleness as data loss.
+- **R2 bucket `bioc-access-logs`: the date prefixes are the abandoned pre-switch Logpush
+  destination** (only 2026-08-06 → 08-07T12:17Z, never growing; not data loss). `parquet/`
+  and `rollups/` in the same bucket are live (this repo writes them).
 - **Analytics Engine (`bioc_site_requests_v3`) is a dashboard, never the record** — sampled,
   three-month retention (ADR 0003).
-- **Gap monitoring: `bioc-logpush-check.timer`** (daily 07:15 MDT, since 2026-08-11) runs
-  `check-logpush.sh`, which fails — filing a GitHub issue via `bioc-notify@`, same channel as
-  the sync timers — unless yesterday's UTC prefix under
-  `gs://bioc-u24-logs/cloudflare/bioc-access-logs/` has ≥ `MIN_OBJECTS` (default 1000; delivery
-  runs ~2600/day since the cutover) delivered objects. Logpush cannot backfill, so this is the
-  alarm ADR 0003 requires. Known residual gap: nothing external notices if the timer itself stops firing.
+- **Gap monitoring: `bioc-logpush-check.timer`** (daily 07:15 MDT) runs `check-logpush.sh`,
+  which fails (filing a GitHub issue via `bioc-notify@`) unless every UTC hour of yesterday has
+  an object and the day has ≥ `MIN_OBJECTS` (1000; ~2,600/day since the cutover). Logpush
+  cannot backfill, so this is the alarm ADR 0003 requires. `./check-logpush.sh 20260928`
+  checks any day. **Dead-man:** `bioc-logpush-check-stale.timer` (12:00) fails if the check
+  has not passed in 36 h (`~/.local/state/bioc-logpush-check.ok`).
 
 ## Package download stats (#11)
 
-`download-stats.py` (`just stats`; timer `bioc-download-stats`, not installed) writes under
+`download-stats.py` (`just stats`; timer `bioc-download-stats`, 03:30 MDT) writes under
 `/data/davsean/bioc-traffic-stats`, nothing public:
 
 - `clients/year=/month=/clients.parquet` — per (date, category, package, bioc_version,
@@ -128,6 +137,85 @@ Things that shape the numbers:
   (~15k clients, ~4M downloads a week) plus ~1.9M distinct browser-UA clients a week.
 - **bioconductor.org returns 403 to the Python-urllib User-Agent** (since it moved behind
   Cloudflare); send one.
+
+## Dashboard rollups (#10, #19)
+
+`just rollup minute|hour|day [--full|--since-yesterday]` writes static files (ADR 0004) to
+`/data/davsean/bioc-traffic-rollups` and copies them to `r2:bioc-access-logs/rollups/`. Not
+public. No `c_ip`; `clients` is a distinct `client_id` count.
+
+| File | Grain, window | Refreshed |
+|---|---|---|
+| `minute.{parquet,json}` | minute, last 6 h | every 15 min, full recompute |
+| `hour.{parquet,json}` | hour, last 30 d | hourly: last few hours only; daily: yesterday + today |
+| `day.{parquet,json}` | day, last 90 d | daily, after the 08:00 UTC re-seal |
+| `overall_day.{parquet,json}` | day, both eras since 2020-01-01, `dimension = 'overall'` only | daily, last 3 days |
+| `window_clients.{parquet,json}` | exact distinct clients over the 30 d / 90 d windows, overall and per class | daily |
+
+Tier rows: `t, dimension, value, client_class, rule_version, requests, bytes, clients`.
+`dimension` is one of `overall`, `status`,
+`status_class`, `country` (Cloudflare era only), `ua_family`, `page`, `referrer` (host),
+`cache`, `package`, `bioc_version`. **`client_class` NULL is the all-classes total**; filter
+it, or sum the classes, never both.
+
+- **Top-N is per bucket** in hour and day: `page`, `referrer`, `ua_family` and `package` keep
+  each bucket's top 25 and fold the rest into `(other)`. Summing them over a window is
+  approximate. Minute keeps a window top-N.
+- **`clients` does not add across buckets.** Window rows in `hour.json`/`day.json` sum
+  requests and bytes and leave `clients` null; use `window_clients` for those.
+- **Incremental = full** is checked by `sql/rollup_merge_check.sql`. Rebuild a tier with
+  `--full` after a `client_class` version bump (hour ~13 min, day ~1 h).
+
+## Querying
+
+Load the views with `just duckdb` (sets the `client_id` salt from GSM, loads
+`sql/{access,client_class,downloads}.sql`). Views: `access` (both eras, with `era`,
+`client_id`, `production`, `cf_asn`, `bot_category`, `cf_country`), `cloudfront_access`,
+`cloudflare_access` (all Cloudflare columns, incl. `cf` JSON), `downloads` (the published
+download definition, plus `package`, `category`, `bioc_version`, `client_class`). Filter on
+`year`/`month`, the Hive partitions, or every query scans 7.5 B rows.
+
+```bash
+# Requests and clients on the cutover day, by era (~20 s)
+just duckdb -c "SELECT era, count(*) n, count(DISTINCT client_id) clients FROM access
+                WHERE year=2026 AND month=9 AND day(date)=28 AND production GROUP BY 1"
+
+# Package downloads by month, fixed + human columns (static file, instant)
+duckdb -c "SELECT month, downloads, distinct_clients, downloads_human, era
+           FROM '/data/davsean/bioc-traffic-stats/package_month.parquet'
+           WHERE package='limma' AND category='bioc' ORDER BY month DESC LIMIT 12"
+
+# Last 24 h by traffic class (rollups; NULL class = total)
+duckdb -c "SELECT client_class, sum(requests) FROM '/data/davsean/bioc-traffic-rollups/hour.parquet'
+           WHERE dimension='overall' AND t >= now() AT TIME ZONE 'UTC' - INTERVAL 24 HOUR
+           GROUP BY 1 ORDER BY 2 DESC"
+
+# Top countries, last 7 days
+duckdb -c "SELECT value, sum(requests) FROM '/data/davsean/bioc-traffic-rollups/day.parquet'
+           WHERE dimension='country' AND client_class IS NULL AND t >= current_date - 7
+           GROUP BY 1 ORDER BY 2 DESC LIMIT 10"
+```
+
+Prefer the rollups and stats files: they answer most questions in milliseconds. Go to `access`
+only for something they don't carry.
+
+## Timers on onclappc02
+
+All are user units symlinked from `systemd/` (install commands in README); failures file a
+GitHub issue via `bioc-notify@`. Times MDT.
+
+| Timer | When | Does |
+|---|---|---|
+| `bioc-logpush-check` | 07:15 | yesterday's delivery: every hour + volume |
+| `bioc-logpush-check-stale` | 12:00 | dead-man on the check above |
+| `bioc-cloudflare-parquet` | every 15 min | current + previous UTC hour → Parquet → R2 |
+| `bioc-cloudflare-parquet-reseal` | 02:00 | re-seal yesterday (late records) |
+| `bioc-download-stats` | 03:30 | stats tree and aggregates |
+| `bioc-rollup-minute` | every 15 min | minute tier |
+| `bioc-rollup-hour` | hourly at :20 | hour tier, recent hours |
+| `bioc-rollup-day` | 04:30 | hour tier since yesterday, day tier, overall series, window clients |
+
+Logs: `journalctl --user -u <unit>`; also shipped to ClickHouse (`default.systemd_user_jobs`).
 
 ## Connecting
 
