@@ -14,11 +14,12 @@
    legacy generator's tree, frozen at its last run) from their index pages, following
    every link that stays inside the tree: category pages, package pages, every .tab, .png,
    .css and .js. The trees are generated HTML, not directory listings, so the HTML is the
-   map. Files land gzipped under <root>/raw/<date>/<URL path>.gz, `zcat` giving the exact
-   bytes received (a directory URL is its index.html, which the server answers
-   identically), with manifest.jsonl beside them: url, path, status, bytes and sha256 (of
-   the uncompressed content), compressed_bytes, content_type, last_modified, fetched_at. A
-   status other than 200 is recorded, body not kept (a missing path answers 308 to
+   map, plus the package pages <p>_pkg_stats.tab and <p>_pkg_scores.tab name (a few new
+   packages are linked from nowhere). Files land gzipped under
+   <root>/raw/<date>/<URL path>.gz, `zcat` giving the exact bytes received (a directory
+   URL is its index.html, which the server answers identically), with manifest.jsonl
+   beside them: url, path, status, bytes and sha256 (of the uncompressed content),
+   compressed_bytes, content_type, last_modified, fetched_at. A status other than 200 is recorded, body not kept (a missing path answers 308 to
    master.bioconductor.org). Network errors are retried with backoff and, if they
    persist, left out of the manifest so a rerun retries them: rerunning with the same
    --date resumes, re-reading the HTML already landed to rediscover links.
@@ -84,6 +85,23 @@ def links(base, body):
         if u.netloc == "bioconductor.org" and (p := canonical(u.path)):
             out.add(p)
     return out
+
+
+def listed(path, body):
+    """Package pages a <p>_pkg_stats.tab or <p>_pkg_scores.tab names: some packages (new
+    ones) are in these but linked from no page."""
+    d = path.rsplit("/", 1)[0]
+    rows = body.decode("utf-8", "replace").split("\n")[1:]
+    return {p for r in rows if (name := r.split("\t", 1)[0].strip())
+            and (p := canonical(f"{d}/{name}/")) and "/" not in name}
+
+
+def discover(snap, path, row):
+    if is_html(row):
+        return links(path, read_gz(snap, row["path"]))
+    if row["status"] == 200 and re.search(r"_pkg_(stats|scores)\.tab$", path):
+        return listed(path, read_gz(snap, row["path"]))
+    return set()
 
 
 def fetch(path):
@@ -165,9 +183,7 @@ def crawl(root, date):
             while todo and len(running) < WORKERS * 4:
                 p = todo.pop()
                 if p in done:
-                    r = done[p]
-                    if is_html(r):
-                        push(links(p, read_gz(snap, r["path"])))
+                    push(discover(snap, p, done[p]))
                     continue
                 running[pool.submit(land, snap, p)] = p
             if not running:
@@ -183,8 +199,7 @@ def crawl(root, date):
                 out.flush()
                 done[p] = r
                 fetched += 1
-                if is_html(r):
-                    push(links(p, read_gz(snap, r["path"])))
+                push(discover(snap, p, r))
                 if r["status"] in (301, 302, 307, 308) and r["location"]:
                     u = urllib.parse.urlsplit(urllib.parse.urljoin(SITE + p, r["location"]))
                     q = canonical(u.path) if u.netloc == "bioconductor.org" else None
@@ -246,7 +261,8 @@ def load_tabs(con, snap):
     bad = con.execute("SELECT path FROM tabs WHERE kind IS NULL").fetchall()
     if bad:
         raise SystemExit(f"{len(bad)} .tab files of no known kind, e.g. {bad[:5]}")
-    # stem is <name>_<YYYY> or <name>; <name> is the package dir, or the category prefix.
+    # stem is <name>_<YYYY> or <name>; <name> is the package dir, or for a category total
+    # its prefix (oldstats, and <p>_pkg_*.tab) or its directory (stats: data-annotation_stats.tab).
     con.execute(f"""
         CREATE OR REPLACE TABLE tabs AS
         SELECT *, CASE WHEN regexp_matches(stem, '_[0-9]{{4}}$') THEN right(stem, 4)::INT END AS file_year,
@@ -256,7 +272,7 @@ def load_tabs(con, snap):
     bad = con.execute(f"""
         SELECT path FROM tabs LEFT JOIN (VALUES {prefixes}) v(category, prefix) USING (category)
         WHERE (kind = 'package' AND name <> package)
-           OR (kind = 'category' AND name IS DISTINCT FROM prefix)""").fetchall()
+           OR (kind = 'category' AND name IS DISTINCT FROM prefix AND name <> category)""").fetchall()
     if bad:
         raise SystemExit(f"{len(bad)} .tab names not matching their directory, e.g. {bad[:5]}")
 
@@ -306,24 +322,34 @@ def normalise(root, date):
         print(f"  {kind}: {n:,d} files")
 
     # The per-year files are the monthly rows; the all-years files must repeat them.
+    con.execute("""
+        CREATE OR REPLACE TABLE rows AS
+        SELECT r.*, EXISTS (SELECT 1 FROM tabs t WHERE t.file_year = r.year AND t.tree = r.tree
+                            AND t.category = r.category AND t.package IS NOT DISTINCT FROM r.package) AS has_year_file
+        FROM rows r""")
     checks = {
         "year file whose rows are not that year":
-            "SELECT DISTINCT path FROM rows WHERE file_year IS NOT NULL AND year <> file_year",
+            "SELECT DISTINCT tree, path FROM rows WHERE file_year IS NOT NULL AND year <> file_year",
         "year file without exactly Jan..Dec + all":
-            """SELECT path FROM rows WHERE file_year IS NOT NULL GROUP BY path
+            """SELECT tree, path FROM rows WHERE file_year IS NOT NULL GROUP BY tree, path
                HAVING count(*) <> 13 OR count(DISTINCT coalesce(month, 0)) <> 13""",
-        "all-years row differing from or missing in its year file":
-            """SELECT tree, category, package, year, month, distinct_ips, downloads FROM rows WHERE file_year IS NULL
+        "all-years row differing from its year file":
+            """SELECT tree, category, package, year, month, distinct_ips, downloads FROM rows r
+               WHERE file_year IS NULL AND has_year_file
                EXCEPT ALL
                SELECT tree, category, package, year, month, distinct_ips, downloads FROM rows WHERE file_year IS NOT NULL""",
+        "all-years row of a year without a year file (kept)":
+            "SELECT tree FROM rows WHERE file_year IS NULL AND NOT has_year_file",
+        "... of which not zero":
+            "SELECT tree FROM rows WHERE file_year IS NULL AND NOT has_year_file AND (downloads > 0 OR distinct_ips > 0)",
         "year-file row missing in the all-years file":
             """SELECT tree, category, package, year, month, distinct_ips, downloads FROM rows WHERE file_year IS NOT NULL
                EXCEPT ALL
                SELECT tree, category, package, year, month, distinct_ips, downloads FROM rows WHERE file_year IS NULL""",
     }
     for what, q in checks.items():
-        n = con.execute(f"SELECT count(*) FROM ({q})").fetchone()[0]
-        print(f"  check: {n:,d} {what}")
+        n = dict(con.execute(f"SELECT tree, count(*) FROM ({q}) GROUP BY tree").fetchall())
+        print(f"  check: {what}: " + ", ".join(f"{t} {n.get(t, 0):,d}" for t in ("stats", "oldstats")))
 
     pkg_files = [f"{snap}/{p}.gz" for (p,) in con.execute(
         "SELECT path FROM tabs WHERE kind = 'pkg_stats' ORDER BY path").fetchall()]
@@ -340,20 +366,15 @@ def normalise(root, date):
                                      'Nb_of_distinct_IPs': 'BIGINT', 'Nb_of_downloads': 'BIGINT'}})""",
                     {"files": pkg_files})
         cols = "tree, category, package, year, month, distinct_ips, downloads"
-        for what, a, b in (("<p>_pkg_stats.tab row not in a package's year file", "pkg_stats",
-                            "rows WHERE package IS NOT NULL AND file_year IS NOT NULL"),
-                           ("package year-file row not in <p>_pkg_stats.tab",
-                            "rows WHERE package IS NOT NULL AND file_year IS NOT NULL", "pkg_stats")):
-            n = con.execute(f"SELECT count(*) FROM (SELECT {cols} FROM {a} EXCEPT ALL SELECT {cols} FROM {b})").fetchone()[0]
-            print(f"  check: {n:,d} {what}")
+        mine = "rows WHERE package IS NOT NULL AND (file_year IS NOT NULL OR NOT has_year_file)"
+        for what, a, b in (("<p>_pkg_stats.tab row not in a package's files", "pkg_stats", mine),
+                           ("package file row not in <p>_pkg_stats.tab", mine, "pkg_stats")):
+            n = dict(con.execute(f"SELECT tree, count(*) FROM (SELECT {cols} FROM {a} EXCEPT ALL "
+                                 f"SELECT {cols} FROM {b}) GROUP BY tree").fetchall())
+            print(f"  check: {what}: " + ", ".join(f"{t} {n.get(t, 0):,d}" for t in ("stats", "oldstats")))
 
     # A (tree, category, package, year) with only an all-years file still counts.
-    pick = """
-        SELECT * FROM rows WHERE file_year IS NOT NULL
-        UNION ALL
-        SELECT * FROM rows r WHERE file_year IS NULL AND NOT EXISTS (
-            SELECT 1 FROM tabs t WHERE t.file_year = r.year AND t.tree = r.tree AND t.category = r.category
-                                   AND t.package IS NOT DISTINCT FROM r.package)"""
+    pick = "SELECT * FROM rows WHERE file_year IS NOT NULL OR NOT has_year_file"
     keys = "tree, category, package, year"
     for name, cols, where in (("published_month", f"{keys}, month", "month IS NOT NULL"),
                               ("published_year", keys, "month IS NULL")):
@@ -689,6 +710,8 @@ def self_check():
                    "/packages/oldstats/bioc/limma/a.tab"}, got
     assert canonical("/packages/stats/") == "/packages/stats/index.html"
     assert canonical("/packages/release/bioc/") is None
+    got = listed("/packages/stats/bioc/bioc_pkg_scores.tab", b"Package\tDownload_score\nBiocDuckDB\t1\na4\t2\n")
+    assert got == {"/packages/stats/bioc/BiocDuckDB/index.html", "/packages/stats/bioc/a4/index.html"}, got
     print("self-check OK")
 
 
