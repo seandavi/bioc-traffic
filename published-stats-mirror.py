@@ -40,6 +40,7 @@ snapshots are never edited; a new date is a new directory.
 import argparse, concurrent.futures as cf, datetime as dt, gzip, hashlib, json, pathlib, re, sys, time
 import urllib.error, urllib.parse, urllib.request
 
+HERE = pathlib.Path(__file__).resolve().parent
 ROOT = pathlib.Path("/data/davsean/bioc-published-stats")
 STATS = pathlib.Path("/data/davsean/bioc-traffic-stats")
 SCRATCH = pathlib.Path("/data/davsean/tmp")
@@ -464,7 +465,8 @@ def compare(root, stats):
     print(md(["month", "category", "package", "pub downloads", "our downloads", "Δ", "pub IPs", "our IPs", "Δ"],
              [(*r[:5], fl(r[5]), r[6], r[7], fl(r[8])) for r in rows]))
 
-    missing_days(con, stats, q)
+    day_runs(con, stats, q)
+    head_requests(con, q)
     cross_category(con, stats, q)
 
 
@@ -476,92 +478,162 @@ def universe(con, stats):
         FROM read_text('{stats}/packages-index/*.txt')""")
 
 
-def missing_days(con, stats, q):
-    """Is a month where ours is higher on both counts the published source missing days?
-    Fit one run of missing days per month to the four category download totals, then
-    test it on distinct IPs, which a day-sum cannot fake: recount over the kept days."""
+def day_runs(con, stats, q):
+    """Is a month that differs the published source missing whole log days, or counting
+    some twice? One run of days [a, b] per month, s = -1 (missing) or +1 (counted twice),
+    fit to the published category totals, downloads and distinct IPs together. Missing
+    days lower both (a client stays if it has a download outside the run); days counted
+    twice raise downloads and leave distinct IPs alone. The fitted run is then tested,
+    out of sample, on the top 20 bioc packages."""
     universe(con, stats)
-    suspects = [r[0] for r in q(f"""
-        SELECT month FROM cmp WHERE package IS NULL AND category = 'bioc'
-          AND {pct('our_dl', 'pub_dl')} > 2 AND {pct('our_ips', 'pub_ips')} > 2 ORDER BY month""")]
-    print("## Hypothesis: the published source is missing log days\n")
-    print(f"Months where bioc is > 2 % higher in ours on both downloads and IPs: "
-          f"{', '.join(m.strftime('%Y-%m') for m in suspects) or 'none'}. For each, the run of whole "
-          "UTC days [a, b] whose removal best fits the published download totals of all four "
-          "categories, then distinct IPs recounted over the remaining days.\n")
+    months = [r[0] for r in q(f"""
+        SELECT DISTINCT month FROM cmp WHERE package IS NULL AND pub_dl > 0
+          AND (abs({pct('our_dl', 'pub_dl')}) > 2 OR abs({pct('our_ips', 'pub_ips')}) > 2) ORDER BY month""")]
+    print("## Hypothesis: the published source is missing log days, or counts some twice\n")
+    print("Months where a category total differs by more than 2 %: "
+          f"{', '.join(m.strftime('%Y-%m') for m in months) or 'none'}. For each, the run of whole "
+          "UTC days whose removal (missing) or repetition (counted twice) best fits the published "
+          "category totals, downloads and distinct IPs together; then the same run applied to "
+          "the top 20 bioc packages, which the fit did not see.\n")
     rows = []
-    for m in suspects:
+    for m in months:
         con.execute(f"""
             CREATE OR REPLACE TABLE days AS
-            SELECT date, category, package, client_id, downloads
+            SELECT day(date) AS d, category, package, client_id, downloads
             FROM read_parquet('{stats}/clients/year={m.year}/month={m.month}/clients.parquet')
             SEMI JOIN universe USING (category, package)""")
-        fit = q(f"""
-            WITH d AS (SELECT day(date) AS d, category, sum(downloads) AS n FROM days GROUP BY ALL),
-            gaps AS (SELECT a, b FROM range(1, 32) r(a), range(1, 32) s(b) WHERE a <= b
-                     UNION ALL SELECT 0, -1),
-            kept AS (SELECT a, b, category, sum(n) FILTER (d < a OR d > b) AS n FROM gaps, d GROUP BY ALL)
-            SELECT a, b, sum(abs(k.n - p.pub_dl) / p.pub_dl) AS err
-            FROM kept k JOIN cmp p ON p.month = DATE '{m}' AND p.package IS NULL AND p.category = k.category
-            GROUP BY a, b ORDER BY err LIMIT 1""")[0]
-        a, b, _ = fit
-        gap = "none" if a == 0 else f"{m:%Y-%m}-{a:02d} → {b:02d}"
+        a, b, sign, _ = q(f"""
+            WITH runs AS (SELECT a, b, s, ((1::BIGINT << b) - (1::BIGINT << (a - 1))) AS g
+                          FROM range(1, 32) r(a), range(1, 32) t(b), (VALUES (-1), (1)) u(s) WHERE a <= b
+                          UNION ALL SELECT 0, -1, 0, 0),
+            d AS (SELECT d, category, sum(downloads) AS n FROM days GROUP BY ALL),
+            c AS (SELECT category, bit_or(1::BIGINT << (d - 1)) AS mask FROM days GROUP BY category, client_id),
+            dl AS (SELECT a, b, s, category, sum(n) + s * coalesce(sum(n) FILTER (d BETWEEN a AND b), 0) AS n
+                   FROM runs, d GROUP BY a, b, s, category),
+            ips AS (SELECT a, b, s, category, count(*) FILTER (s >= 0 OR mask & ~g <> 0) AS n
+                    FROM runs, c GROUP BY a, b, s, category)
+            SELECT a, b, s, sum(abs(dl.n - p.pub_dl) / p.pub_dl + abs(ips.n - p.pub_ips) / p.pub_ips) AS err
+            FROM dl JOIN ips USING (a, b, s, category)
+            JOIN cmp p ON p.month = DATE '{m}' AND p.package IS NULL AND p.category = dl.category
+            WHERE p.pub_dl > 0
+            GROUP BY a, b, s ORDER BY err LIMIT 1""")[0]
+        run = ("none" if sign == 0 else
+               f"{m:%m}-{a:02d} → {b:02d} {'missing' if sign < 0 else 'counted twice'}")
+        fitted = f"""SELECT category, package, sum(downloads) + {sign} * coalesce(sum(downloads) FILTER
+                                                (d BETWEEN {a} AND {b}), 0) AS dl,
+                            count(DISTINCT client_id) FILTER ({sign} >= 0 OR NOT d BETWEEN {a} AND {b}) AS ips
+                     FROM days"""
         for r in q(f"""
-            WITH k AS (SELECT category, sum(downloads) AS dl, count(DISTINCT client_id) AS ips FROM days
-                       WHERE NOT day(date) BETWEEN {a} AND {b} GROUP BY ALL)
+            WITH k AS ({fitted} GROUP BY GROUPING SETS ((category), (category, package)))
             SELECT category, pub_dl, our_dl, k.dl, {pct('k.dl', 'pub_dl')}, pub_ips, our_ips, k.ips,
                    {pct('k.ips', 'pub_ips')}
-            FROM k JOIN cmp USING (category) WHERE month = DATE '{m}' AND package IS NULL
+            FROM k JOIN cmp USING (category) WHERE month = DATE '{m}' AND cmp.package IS NULL AND k.package IS NULL
+              AND pub_dl > 0
             ORDER BY category"""):
-            rows.append((f"{m:%Y-%m}", gap, *r[:4], fl(r[4]), *r[5:8], fl(r[8])))
-        # The same gap, package by package (top 20 bioc by published downloads).
+            rows.append((f"{m:%Y-%m}", run, *r[:4], fl(r[4]), *r[5:8], fl(r[8])))
         r = q(f"""
-            WITH k AS (SELECT category, package, sum(downloads) AS dl, count(DISTINCT client_id) AS ips
-                       FROM days WHERE NOT day(date) BETWEEN {a} AND {b} GROUP BY ALL),
+            WITH k AS ({fitted} WHERE category = 'bioc' GROUP BY category, package),
             top AS (SELECT * FROM cmp WHERE month = DATE '{m}' AND category = 'bioc' AND package IS NOT NULL
                     ORDER BY pub_dl DESC LIMIT 20)
             SELECT median(abs({pct('k.dl', 'pub_dl')})), median(abs({pct('k.ips', 'pub_ips')})),
                    median(abs({pct('our_dl', 'pub_dl')})), median(abs({pct('our_ips', 'pub_ips')}))
             FROM top JOIN k USING (category, package)""")[0]
-        rows.append((f"{m:%Y-%m}", gap, "top 20 bioc packages, median \\|Δ\\|", "", f"{r[2]:.2f} %", "",
+        rows.append((f"{m:%Y-%m}", run, "top 20 bioc packages, median \\|Δ\\|", "", f"{r[2]:.2f} %", "",
                      f"{r[0]:.2f} %", "", f"{r[3]:.2f} %", "", f"{r[1]:.2f} %"))
-    print(md(["month", "best-fit missing days", "category", "pub downloads", "ours", "ours, gap removed", "Δ",
-              "pub IPs", "ours", "ours, gap removed", "Δ"], rows))
+    print(md(["month", "best-fit run of days", "category", "pub downloads", "ours", "ours, fitted", "Δ",
+              "pub IPs", "ours", "ours, fitted", "Δ"], rows))
+    print("Top-20 rows: the Δ columns are median |Δ| before (\"ours\") and after (\"ours, fitted\").\n")
+
+
+def head_requests(con, q):
+    """Do the published files count HEAD requests? Our fixed definition excludes them.
+    HEAD with status 200 per (month, category, package), from the downloads view with
+    only the method and status swapped, so URL parsing and hosts are the same."""
+    view = (HERE / "sql" / "downloads.sql").read_text()
+    swaps = {"cs_method <> 'HEAD'": "cs_method = 'HEAD'",
+             "sc_status IN ('200','301','302','307','308')": "sc_status = '200'",
+             "VIEW downloads AS": "VIEW head_requests AS"}
+    for a, b in swaps.items():
+        assert view.count(a) == 1, f"sql/downloads.sql no longer has {a!r}"
+        view = view.replace(a, b)
+    for f in ("access.sql", "client_class.sql"):
+        con.execute((HERE / "sql" / f).read_text())
+    con.execute(view)
+    t0 = time.time()
+    con.execute(f"""
+        CREATE OR REPLACE TABLE head AS
+        SELECT make_date(year, month, 1) AS month, category, package, count(*) AS h200
+        FROM head_requests SEMI JOIN universe USING (category, package)
+        WHERE production AND make_date(year, month, 1) BETWEEN '{WINDOW[0]}' AND '{WINDOW[1]}'
+        GROUP BY ALL""")
+    con.execute("""
+        CREATE OR REPLACE TABLE cmp_head AS
+        SELECT c.*, coalesce(h.h200, 0) AS h200, strftime(month, '%Y-') || (CASE WHEN month(month) <= 6
+               THEN 'H1' ELSE 'H2' END) AS half
+        FROM cmp c LEFT JOIN (FROM head UNION ALL
+                              SELECT month, category, NULL, sum(h200) FROM head GROUP BY ALL) h
+          ON h.month = c.month AND h.category = c.category AND h.package IS NOT DISTINCT FROM c.package""")
+    print("## Hypothesis: the published files count HEAD requests\n")
+    print(f"HEAD requests answered 200 (package paths, production hosts; {time.time() - t0:.0f} s to "
+          "count) added to ours. Δ as above, then \"+HEAD\" = (ours + HEAD 200 − published) / "
+          "published. By half-year, median over months (bioc total) and over package-months with "
+          "≥ 100 published downloads (all categories):\n")
+    rows = q(f"""
+        SELECT half,
+               median({pct('our_dl', 'pub_dl')}) FILTER (package IS NULL AND category = 'bioc'),
+               median({pct('our_dl + h200', 'pub_dl')}) FILTER (package IS NULL AND category = 'bioc'),
+               count(*) FILTER (package IS NOT NULL AND pub_dl >= 100 AND our_dl > 0),
+               median(abs({pct('our_dl', 'pub_dl')})) FILTER (package IS NOT NULL AND pub_dl >= 100 AND our_dl > 0),
+               median(abs({pct('our_dl + h200', 'pub_dl')})) FILTER (package IS NOT NULL AND pub_dl >= 100 AND our_dl > 0)
+        FROM cmp_head GROUP BY half ORDER BY half""")
+    print(md(["half-year", "bioc total, median Δ", "+HEAD", "package-months", "median |Δ|", "+HEAD"],
+             [(r[0], fl(r[1]), fl(r[2]), r[3], f"{r[4]:.2f} %", f"{r[5]:.2f} %") for r in rows]))
+    print("Category-months with |Δ downloads| > 2 %:\n")
+    rows = q(f"""
+        SELECT strftime(month, '%Y-%m'), category, pub_dl, our_dl, h200, {pct('our_dl', 'pub_dl')},
+               {pct('our_dl + h200', 'pub_dl')}, {pct('our_ips', 'pub_ips')}
+        FROM cmp_head WHERE package IS NULL AND pub_dl > 0 AND abs({pct('our_dl', 'pub_dl')}) > 2
+        ORDER BY month, category""")
+    print(md(["month", "category", "pub downloads", "ours", "HEAD 200", "Δ", "+HEAD", "Δ IPs"],
+             [(*r[:5], fl(r[5]), fl(r[6]), fl(r[7])) for r in rows]))
 
 
 def cross_category(con, stats, q):
     """Does the published file for (category, package) count the package's downloads
     under every category path? Only package-months with material cross-category traffic
-    (all-paths downloads > own-path by > 2 %) can tell the two rules apart."""
+    (all-paths downloads > own-path by > 2 %) can tell the rules apart. Each is assigned
+    the rule closest to the published downloads, if within 2 %: own path or all paths,
+    each with or without HEAD 200s."""
     con.execute(f"""
         CREATE OR REPLACE TABLE anycat AS
-        SELECT make_date(year, month, 1) AS month, package, sum(downloads) AS dl,
-               count(DISTINCT client_id) AS ips
+        SELECT make_date(year, month, 1) AS month, package, sum(downloads) AS dl
         FROM read_parquet('{stats}/clients/*/*/clients.parquet', hive_partitioning = true)
         WHERE make_date(year, month, 1) BETWEEN '{WINDOW[0]}' AND '{WINDOW[1]}'
         GROUP BY ALL""")
-    con.execute(f"""
+    con.execute("""
         CREATE OR REPLACE TABLE xcat AS
-        SELECT c.*, a.dl AS any_dl, a.ips AS any_ips,
-               CASE WHEN abs(our_dl - pub_dl) <= 0.02 * pub_dl THEN 'own path'
-                    WHEN abs(a.dl - pub_dl) <= 0.02 * pub_dl THEN 'all paths'
-                    ELSE 'neither' END AS rule
-        FROM cmp c JOIN anycat a USING (month, package)
-        WHERE c.package IS NOT NULL AND pub_dl >= 100 AND a.dl > 1.02 * our_dl""")
+        WITH h AS (SELECT month, package, sum(h200) AS h200 FROM head GROUP BY ALL),
+        x AS (SELECT c.*, a.dl AS any_dl, coalesce(h.h200, 0) AS any_h200
+              FROM cmp_head c JOIN anycat a USING (month, package) LEFT JOIN h USING (month, package)
+              WHERE c.package IS NOT NULL AND pub_dl >= 100 AND a.dl > 1.02 * our_dl),
+        r AS (SELECT x.*, rule, abs(n - pub_dl) / pub_dl AS err
+              FROM x, LATERAL (VALUES ('own path', our_dl), ('own path + HEAD', our_dl + h200),
+                                      ('all paths', any_dl), ('all paths + HEAD', any_dl + any_h200)) v(rule, n))
+        SELECT month, category, package, CASE WHEN min(err) <= 0.02 THEN arg_min(rule, err) ELSE 'neither' END AS rule
+        FROM r GROUP BY ALL""")
+    rules = ["own path", "own path + HEAD", "all paths", "all paths + HEAD", "neither"]
+    counts = ", ".join(f"count(*) FILTER (rule = '{r}')" for r in rules)
     print("## Hypothesis: the published files count a package under every category path\n")
     print("Package-months with ≥ 100 published downloads whose downloads over all category "
-          "paths exceed the own-path count by > 2 %, classified by which matches the published "
-          "downloads within 2 %. By year and category:\n")
-    rows = q("""SELECT year(month)::VARCHAR, category, count(*), count(*) FILTER (rule = 'own path'),
-                       count(*) FILTER (rule = 'all paths'), count(*) FILTER (rule = 'neither')
-                FROM xcat GROUP BY ALL ORDER BY ALL""")
-    print(md(["year", "category", "package-months", "own path", "all paths", "neither"], rows))
-    print("Months where 'all paths' wins most often:\n")
-    rows = q("""SELECT strftime(month, '%Y-%m'), count(*), count(*) FILTER (rule = 'own path'),
-                       count(*) FILTER (rule = 'all paths'), count(*) FILTER (rule = 'neither')
-                FROM xcat GROUP BY month HAVING count(*) FILTER (rule = 'all paths') > 0
-                ORDER BY count(*) FILTER (rule = 'all paths') DESC, month LIMIT 15""")
-    print(md(["month", "package-months", "own path", "all paths", "neither"], rows))
+          "paths exceed the own-path count by > 2 %, by the rule closest to the published "
+          "downloads (within 2 %). By year and category:\n")
+    rows = q(f"SELECT year(month)::VARCHAR, category, count(*), {counts} FROM xcat GROUP BY ALL ORDER BY ALL")
+    print(md(["year", "category", "package-months", *rules], rows))
+    print("Months where an all-paths rule fits most often:\n")
+    rows = q(f"""SELECT strftime(month, '%Y-%m'), count(*), {counts} FROM xcat GROUP BY month
+                 HAVING count(*) FILTER (rule LIKE 'all paths%') > 0
+                 ORDER BY count(*) FILTER (rule LIKE 'all paths%') DESC, month LIMIT 15""")
+    print(md(["month", "package-months", *rules], rows))
 
 
 def latest(root):
