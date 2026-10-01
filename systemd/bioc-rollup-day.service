@@ -9,9 +9,12 @@ Type=oneshot
 WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
 # just, duckdb, gcloud, rclone
 Environment=PATH=/home/davsean/.local/bin:/usr/bin:/bin
-ExecStart=/home/davsean/.local/bin/just rollup day
+# After the 08:00 UTC re-seal: pick up its changes to yesterday's hours, then the day tier
+# (which also runs rollup-overall and rollup-clients).
+ExecStart=/home/davsean/.local/bin/just rollup hour --since-yesterday
+ExecStart=/home/davsean/.local/bin/just rollup day --since-yesterday
 ExecStart=/home/davsean/.local/bin/just rollup-upload
-# ~48 min for 90 d, plus ~2 s for the overall series (~11 min the first time, from 2020),
-# measured 2026-09-30 on a busy onclappc02.
-TimeoutStartSec=3h
+# Incremental: seconds for the tiers, minutes for the 90 d window_clients scan. A --full
+# day rebuild (~48 min) is run by hand, not here.
+TimeoutStartSec=1h
 Nice=10

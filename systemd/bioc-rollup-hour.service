@@ -11,7 +11,6 @@ WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
 Environment=PATH=/home/davsean/.local/bin:/usr/bin:/bin
 ExecStart=/home/davsean/.local/bin/just rollup hour
 ExecStart=/home/davsean/.local/bin/just rollup-upload
-# ~25 min for 30 d at the justfile's 32 GB / 16 threads, measured 2026-09-30 on a busy
-# onclappc02. Stop before the next hourly run is due.
-TimeoutStartSec=55m
+# Incremental (#19): ~2 s, measured 2026-09-30. A --full rebuild (~13-25 min) is by hand.
+TimeoutStartSec=15m
 Nice=10
