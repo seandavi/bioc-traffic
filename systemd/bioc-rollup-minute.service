@@ -5,6 +5,8 @@ Wants=network-online.target
 OnFailure=bioc-notify@%N.service
 
 [Service]
+# DuckDB opens every Parquet file in the glob; the user-manager default soft limit is 1024 (1653 files by 2026-10-13)
+LimitNOFILE=65536
 Type=oneshot
 WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
 # just, duckdb, gcloud, rclone
