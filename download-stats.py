@@ -336,6 +336,7 @@ def write_stats(con, out, published=None):
         tab(d / f"{prefix}_pkg_scores.tab", ("Package", "Download_score"), scores)
     n_files = sum(1 for _ in new.rglob("*.tab"))
     (new / "DATA_AS_OF").write_text(f"{as_of}\n")
+    write_pages(new, out / "packages-index")   # before the swap: pages and .tab files land together
     old = out / "stats.old"
     shutil.rmtree(old, ignore_errors=True)
     if (out / "stats").exists():
@@ -639,8 +640,6 @@ def run(out, rebuild_all, salt, published):
     load_repo_downloads(con, out, package_universe(out))
     write_aggregates(con, out, published)
     write_stats(con, out, published)
-    print("pages:", flush=True)
-    write_pages(out / "stats", out / "packages-index")
 
 
 # --- checks ----------------------------------------------------------------------------
@@ -755,9 +754,9 @@ def self_check():
             "each category back to its own first year"
         assert (s / "bioc_2019_stats.tab").read_text().split("\n")[-2:] == ["2019\tDec\t9\t20", "2019\tall\t8\t20"]
 
-        # Stage 4: the pages, from that tree. limma has 2026, 2025 and 2019 (published) blocks.
+        # Stage 4: write_stats wrote the pages before its swap. limma has 2026, 2025 and 2019 (published) blocks.
         t = out / "stats"
-        write_pages(t)
+        assert not (out / "stats.partial").exists() and (t / "index.html").exists(), "pages swapped in with the tree"
         assert (t / "static" / "barchart.js").read_bytes() == (HERE / "static" / "barchart.js").read_bytes()
         page = (s / "limma" / "index.html").read_text()
         assert re.findall(r'<canvas id="(barchart_\d+)" class="barchart" width="720" height="400">', page) == \
