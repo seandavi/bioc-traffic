@@ -40,8 +40,8 @@ Three stages, all under --out (default /data/davsean/bioc-traffic-stats):
 
 3. stats/ — the /packages/stats/ tree (ADR 0004 contract) from the fixed columns:
      <cat>/<pkg>/<pkg>_stats.tab, <cat>/<pkg>/<pkg>_<year>_stats.tab
-     <cat>/<p>_stats.tab, <cat>/<p>_<year>_stats.tab, <cat>/<p>_pkg_stats.tab,
-     <cat>/<p>_pkg_scores.tab       (<p>: bioc, annotation, experiment, workflows)
+     <cat>/<cat>_stats.tab, <cat>/<cat>_<year>_stats.tab  (live names: data-annotation_stats.tab)
+     <cat>/<p>_pkg_stats.tab, <cat>/<p>_pkg_scores.tab    (<p>: bioc, annotation, experiment, workflows)
    Formats match the live files: tab-separated, no trailing newline, a year block is its
    12 months plus an 'all' row whose distinct count is over the whole year (not a sum),
    years newest first, a package's years without downloads omitted, packages sorted
@@ -309,9 +309,9 @@ def write_stats(con, out, published=None):
         all_years = []
         for y in range(as_of.year, first - 1, -1):
             block = year_block(y, months.get((cat, None, y), {}), years.get((cat, None, y), (0, 0)))
-            tab(d / f"{prefix}_{y}_stats.tab", head, block)
+            tab(d / f"{cat}_{y}_stats.tab", head, block)
             all_years += block
-        tab(d / f"{prefix}_stats.tab", head, all_years)
+        tab(d / f"{cat}_stats.tab", head, all_years)
         pkgs = sorted({p for c, p, _ in years if c == cat and p is not None}, key=lambda p: (p.lower(), p))
         pkg_rows, scores = [], []
         for p in pkgs:
@@ -421,6 +421,8 @@ def self_check():
         assert (s / "bioc_pkg_scores.tab").read_text() == "Package\tDownload_score"
         assert (s / "bioc_stats.tab").read_text().split("\n")[2] == "2026\tFeb\t2\t3"
         assert (s / "bioc_pkg_stats.tab").read_text().split("\n")[1] == "limma\t2026\tJan\t0\t0"
+        da = out / "stats" / "data-annotation"   # category totals take the directory name, as live
+        assert (da / "data-annotation_stats.tab").exists() and (da / "data-annotation_2026_stats.tab").exists() and (da / "annotation_pkg_stats.tab").exists() and not (da / "annotation_stats.tab").exists()
         assert not (out / "stats" / "workflows" / "limma").exists(), "not in the workflows universe"
 
         # Published history: months before JOIN, tree 'stats', non-zero; the rest ignored.
