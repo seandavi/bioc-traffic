@@ -47,6 +47,18 @@ stats *args:
 stats-self-check:
     ./download-stats.py --self-check
 
+stats_tree := env("BIOC_STATS_TREE", "/data/davsean/bioc-traffic-stats/stats")
+stats_dest := env("BIOC_STATS_DEST", "r2:bioc-site/packages/stats")
+
+# The Worker's bucket, where bioc-edge serves /packages/stats/*.tab from (bioc-infrastructure#114).
+# The tree is rewritten every run, so --checksum (MD5 against R2's ETag, from the listing) is
+# what keeps this to the files whose bytes changed. copy, not sync: nothing is deleted.
+# text/plain as master serves them. Pass --dry-run to see what would move.
+# The /packages/stats/ .tab files to R2, changed files only: just stats-upload [--dry-run]
+stats-upload *args:
+    rclone copy {{stats_tree}} {{stats_dest}} --include '*.tab' --checksum --transfers 16 \
+      --header-upload 'Content-Type: text/plain; charset=utf-8' --stats-one-line -v {{args}}
+
 rollups := env("BIOC_ROLLUPS", "/data/davsean/bioc-traffic-rollups")
 # A shared, busy host: cap DuckDB, spill to /data rather than /tmp.
 rollup_limits := "SET memory_limit = '32GB'; SET threads = 16; SET temp_directory = '/data/davsean/tmp/duckdb-rollups';"

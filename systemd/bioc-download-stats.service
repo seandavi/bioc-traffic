@@ -1,5 +1,5 @@
 [Unit]
-Description=Package download stats, both eras -> Parquet + /packages/stats/ tree (bioc-traffic#11)
+Description=Package download stats, both eras -> Parquet + /packages/stats/ tree, then R2 (bioc-traffic#11)
 After=network-online.target
 Wants=network-online.target
 OnFailure=bioc-notify@%N.service
@@ -9,7 +9,11 @@ OnFailure=bioc-notify@%N.service
 LimitNOFILE=65536
 Type=oneshot
 WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
+# just, rclone
+Environment=PATH=/home/davsean/.local/bin:/usr/bin:/bin
 ExecStart=/home/davsean/.local/bin/uv run --script /home/davsean/Documents/git/bioc-traffic/download-stats.py
+# Then the .tab files the Worker serves (bioc-infrastructure#114). A failed upload fails the unit.
+ExecStart=/home/davsean/.local/bin/just stats-upload
 # Stale months (the current one, ~1-4 min) plus aggregates and the tree (~28 min),
 # measured 2026-09-30 on a busy onclappc02.
 TimeoutStartSec=3h
