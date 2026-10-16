@@ -47,7 +47,9 @@ Three stages, all under --out (default /data/davsean/bioc-traffic-stats):
    years newest first, a package's years without downloads omitted, packages sorted
    case-insensitively. Download_score = floor(sum of monthly distinct clients over the
    12 complete months before the last data month / 12), for packages with any.
-   Years start at 2020: the logs do, and earlier years cannot be regenerated.
+   Years from 2020 come from the logs. Earlier years cannot be regenerated, so they are
+   the published snapshot's rows as published (--published and the published_year.parquet
+   beside it, tree 'stats'); without those files the tree starts at 2020.
 
 Stages 2 and 3 count only (category, package) pairs a Bioconductor repository has listed:
 the Package: fields of /packages/<v>/<cat>/src/contrib/PACKAGES for every release. The
@@ -260,23 +262,33 @@ def tab(path, header, rows):
     path.write_text("\n".join("\t".join(map(str, r)) for r in [header, *rows]))
 
 
-def write_stats(con, out):
+def write_stats(con, out, published=None):
     """Rebuild <out>/stats beside the old tree, then swap it in."""
     t0 = time.time()
     as_of = con.execute("SELECT max(date) FROM repo_downloads").fetchone()[0]
-    first = con.execute("SELECT min(year) FROM repo_downloads").fetchone()[0]
     # Everything the tree needs in one scan: per package and per category, per month and year.
     rows = con.execute(f"""
-        SELECT category, package, year, month, count(DISTINCT client_id), sum(downloads)::BIGINT
+        SELECT category, package, year, month(month), count(DISTINCT client_id), sum(downloads)::BIGINT
         FROM repo_downloads WHERE regexp_matches(package, '{PACKAGE_NAME}')
         GROUP BY GROUPING SETS ((category, package, year, month), (category, package, year),
                                 (category, year, month), (category, year))""").fetchall()
+    # The years before JOIN, as published: per package (or category, package NULL), months
+    # and the year's 'all' row, whose distinct count does not come from the months.
+    pub_year = published and published.with_name("published_year.parquet")
+    if pub_year and published.exists() and pub_year.exists():
+        rows += con.execute(f"""
+            SELECT category, package, year, month, distinct_ips, downloads FROM read_parquet('{published}')
+            WHERE tree = 'stats' AND year < {JOIN[:4]}
+            UNION ALL
+            SELECT category, package, year, NULL, distinct_ips, downloads FROM read_parquet('{pub_year}')
+            WHERE tree = 'stats' AND year < {JOIN[:4]}
+              AND (package IS NULL OR regexp_matches(package, '{PACKAGE_NAME}'))""").fetchall()
     months, years = {}, {}   # (category, package|None, year) -> {month: (ips, n)} / (ips, n)
     for cat, pkg, y, m, ips, n in rows:
         if m is None:
             years[cat, pkg, y] = (ips, n)
         else:
-            months.setdefault((cat, pkg, y), {})[m.month] = (ips, n)
+            months.setdefault((cat, pkg, y), {})[m] = (ips, n)
 
     # The 12 complete months before as_of's month, as (year, month).
     now = as_of.year * 12 + as_of.month - 1
@@ -286,6 +298,8 @@ def write_stats(con, out):
     head = ("Year", "Month", "Nb_of_distinct_IPs", "Nb_of_downloads")
     for cat, (prefix, _) in CATEGORIES.items():
         d = new / cat
+        # A category's years run back to its own first (workflows: 2013), as published.
+        first = min((y for c, _, y in [*years, *months] if c == cat), default=as_of.year)
         all_years = []
         for y in range(as_of.year, first - 1, -1):
             block = year_block(y, months.get((cat, None, y), {}), years.get((cat, None, y), (0, 0)))
@@ -299,7 +313,7 @@ def write_stats(con, out):
             for y in range(as_of.year, first - 1, -1):
                 if (cat, p, y) not in years:
                     continue
-                block = year_block(y, months[cat, p, y], years[cat, p, y])
+                block = year_block(y, months.get((cat, p, y), {}), years[cat, p, y])
                 tab(d / p / f"{p}_{y}_stats.tab", head, block)
                 blocks += block
             tab(d / p / f"{p}_stats.tab", head, blocks)
@@ -327,7 +341,7 @@ def run(out, rebuild_all, salt, published):
     print("aggregates:", flush=True)
     load_repo_downloads(con, out, package_universe(out))
     write_aggregates(con, out, published)
-    write_stats(con, out)
+    write_stats(con, out, published)
 
 
 # --- checks ----------------------------------------------------------------------------
@@ -420,6 +434,19 @@ def self_check():
                        "overall_month": [(dt.date(2019, 12, 1), 26, None, *none)]}, got
         assert con.execute(f"SELECT count(*) FROM '{out}/package_month.parquet' WHERE source = 'logs' "
                            "AND month = DATE '2026-02-01'").fetchone()[0] == 3
+        # The tree's years before JOIN: published months, and the year row as published.
+        con.execute(f"""COPY (FROM (VALUES ('stats', 'bioc', 'limma', 2019, 6, 12), ('stats', 'bioc', NULL, 2019, 8, 20),
+            ('stats', 'bioc', 'limma', 2020, 99, 99), ('stats', 'bioc', 'gone', 2010, 1, 2))
+            v(tree, category, package, year, distinct_ips, downloads)) TO '{out}/published_year.parquet' (FORMAT parquet)""")
+        write_stats(con, out, pub)
+        lines = (s / "limma" / "limma_stats.tab").read_text().split("\n")
+        assert len(lines) == 40 and lines[27:] == [
+            *(f"2019\t{m}\t0\t0" for m in MONTHS[:10]), "2019\tNov\t0\t0", "2019\tDec\t5\t7", "2019\tall\t6\t12"], lines
+        assert (s / "limma" / "limma_2019_stats.tab").exists() and (s / "gone" / "gone_2010_stats.tab").exists()
+        assert (s / "bioc_stats.tab").read_text().split("\n")[-1] == "2010\tall\t0\t0", "category years run back to the first"
+        assert (s.parent / "data-annotation" / "annotation_stats.tab").read_text().split("\n")[-1] == "2019\tall\t0\t0", \
+            "each category back to its own first year"
+        assert (s / "bioc_2019_stats.tab").read_text().split("\n")[-2:] == ["2019\tDec\t9\t20", "2019\tall\t8\t20"]
     print("self-check OK (downloads view = DOWNLOADS_SQL filter; aggregates; published history; stats tree format)")
 
 
