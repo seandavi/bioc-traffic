@@ -274,11 +274,17 @@ def write_stats(con, out, published=None):
                                 (category, year, month), (category, year))""").fetchall()
     # The years before JOIN, as published: per package (or category, package NULL), months
     # and the year's 'all' row, whose distinct count does not come from the months.
-    pub_year = published and published.with_name("published_year.parquet")
-    if pub_year and published.exists() and pub_year.exists():
+    # Asked for and absent is fatal, not a skip: the upload would overwrite R2's full-history
+    # files with ones starting at 2020 (bioc-infrastructure#114). None (the self-check) skips.
+    if published:
+        pub_year = published.with_name("published_year.parquet")
+        if not (published.exists() and pub_year.exists()):
+            raise SystemExit(f"no {published} or {pub_year}: refusing to write a tree without "
+                             f"the years before {JOIN[:4]} (restore them, see published-normalise)")
         rows += con.execute(f"""
             SELECT category, package, year, month, distinct_ips, downloads FROM read_parquet('{published}')
             WHERE tree = 'stats' AND year < {JOIN[:4]}
+              AND (package IS NULL OR regexp_matches(package, '{PACKAGE_NAME}'))
             UNION ALL
             SELECT category, package, year, NULL, distinct_ips, downloads FROM read_parquet('{pub_year}')
             WHERE tree = 'stats' AND year < {JOIN[:4]}
@@ -438,6 +444,12 @@ def self_check():
         con.execute(f"""COPY (FROM (VALUES ('stats', 'bioc', 'limma', 2019, 6, 12), ('stats', 'bioc', NULL, 2019, 8, 20),
             ('stats', 'bioc', 'limma', 2020, 99, 99), ('stats', 'bioc', 'gone', 2010, 1, 2))
             v(tree, category, package, year, distinct_ips, downloads)) TO '{out}/published_year.parquet' (FORMAT parquet)""")
+        try:
+            write_stats(con, out, out / "missing.parquet")
+            raise AssertionError("a missing published snapshot must fail, not truncate the tree")
+        except SystemExit:
+            pass
+        assert (s / "limma" / "limma_stats.tab").exists(), "the refused run left the old tree in place"
         write_stats(con, out, pub)
         lines = (s / "limma" / "limma_stats.tab").read_text().split("\n")
         assert len(lines) == 40 and lines[27:] == [
