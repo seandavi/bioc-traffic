@@ -51,6 +51,11 @@ Three stages, all under --out (default /data/davsean/bioc-traffic-stats):
    the published snapshot's rows as published (--published and the published_year.parquet
    beside it, tree 'stats'); without those files the tree starts at 2020.
 
+4. HTML pages (#28), generated from the stats/ tree itself, so they cannot disagree with the
+   .tab files: stats/index.html, stats/<cat>.html (listing pages, the index's links),
+   stats/<cat>/index.html, stats/<cat>/<pkg>/index.html and stats/static/barchart.js
+   (copied from static/). Master's design as it was (#28 decision), Chart.js pinned.
+
 Stages 2 and 3 count only (category, package) pairs a Bioconductor repository has listed:
 the Package: fields of /packages/<v>/<cat>/src/contrib/PACKAGES for every release. The
 CloudFront era answers any .../<cat>/src/contrib/<x>_<v>.tar.gz with a 302, so without
@@ -59,7 +64,7 @@ universe (it covers all 6,356 published pairs). The indexes are cached in
 <out>/packages-index/; release and devel are refetched every run.
 """
 
-import argparse, datetime as dt, os, pathlib, re, runpy, shutil, sys, tempfile, time, urllib.error, urllib.request
+import argparse, datetime as dt, functools, json, os, pathlib, re, runpy, shutil, sys, tempfile, time, urllib.error, urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
 OUT = pathlib.Path("/data/davsean/bioc-traffic-stats")
@@ -331,6 +336,7 @@ def write_stats(con, out, published=None):
         tab(d / f"{prefix}_pkg_scores.tab", ("Package", "Download_score"), scores)
     n_files = sum(1 for _ in new.rglob("*.tab"))
     (new / "DATA_AS_OF").write_text(f"{as_of}\n")
+    write_pages(new, out / "packages-index")   # before the swap: pages and .tab files land together
     old = out / "stats.old"
     shutil.rmtree(old, ignore_errors=True)
     if (out / "stats").exists():
@@ -338,6 +344,292 @@ def write_stats(con, out, published=None):
     new.rename(out / "stats")
     shutil.rmtree(old, ignore_errors=True)
     print(f"  stats/: {n_files:,d} files, data as of {as_of}  {time.time() - t0:.0f}s", flush=True)
+
+
+# --- stage 4: the HTML pages -----------------------------------------------------------
+
+CHARTJS = "https://cdn.jsdelivr.net/npm/chart.js@4.5.1"   # master loads the unpinned `chart.js`
+TOP = {"bioc": 75, "data-annotation": 30, "data-experiment": 15}   # "Top N" on the listing pages
+# category -> (listing page, plural in titles, singular in the "All ... packages" text, "software" etc.)
+KIND = {"bioc": ("index.html", "software", "software"), "data-annotation": ("data-annotation.html", "annotation", "annotation"),
+        "data-experiment": ("data-experiment.html", "experiment", "experiment"),
+        "workflows": ("workflows.html", "workflow", "workflow")}
+CSS = """        BODY {
+            font-family: sans-serif;
+            font-size: 10pt;
+        }
+
+        H1 {
+            font-size: 16pt;
+        }
+
+        H2 {
+            font-size: 14pt;
+            margin-top: 8px;
+            margin-bottom: 4px;
+        }
+
+        H3 {
+            font-size: 12pt;
+            margin-top: 0px;
+            margin-bottom: 4px;
+        }
+
+        H4 {
+            font-size: 11pt;
+            margin-top: 0px;
+            margin-bottom: 4px;
+        }
+
+        TABLE.stats {
+            border: solid black 1px;
+        }
+"""
+CSS_LISTING = CSS + """        .column-container {
+            display: flex;
+        }
+        .column {
+            flex: 1;
+        }
+"""
+CANVAS_FALLBACK = "Your browser may be too old as it does not support the html canvas element."
+
+
+def read_tab(path):
+    """A .tab file as a list of rows (header dropped)."""
+    return [l.split("\t") for l in path.read_text().split("\n")[1:] if l]
+
+
+def year_blocks(path):
+    """{year: [(month, ips, n) x 13]}, newest year first, from a *_stats.tab."""
+    blocks = {}
+    for y, m, ips, n in read_tab(path):
+        blocks.setdefault(int(y), []).append((m, int(ips), int(n)))
+    return dict(sorted(blocks.items(), reverse=True))
+
+
+def stats_page(title, back, intro, blocks, prefix, as_of):
+    """One package or category page. Master's markup, with its quirks (`algin`, the table layout)."""
+    years = list(blocks)
+    h = [f"""<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+
+<head>
+    <title> {title} </title>
+    <style>
+{CSS}    </style>
+</head>
+
+<body>
+    <table style="width: 100%; border-spacing: 0px; border-collapse: collapse">
+        <tr>
+            <td style="padding: 0px; text-align: left">
+                <i><a href="{back[0]}">Back to the "{back[1]}"</a></i>
+            </td>
+        </tr>
+    </table>
+
+    <h1 style="text-align: center"> {title} </h1>
+    <p style="text-align: center">
+        <i>Data as of {as_of}</i>
+    </p>
+    {intro}
+    <p style="text-align: center">
+        Number of package downloads from the Bioconductor software package
+        repository, year by year, from {years[0]} back to {years[-1]} (years with no downloads are omitted):
+    </p>
+"""]
+    for y, rows in blocks.items():
+        h.append(f"""
+        <hr />
+        <h2 style="text-align: center">{y}</h2>
+        <table width="90%" align="center">
+            <tr>
+                <td style="text-align: center">
+                    <canvas id="barchart_{y}" class="barchart" width="720" height="400">
+                        {CANVAS_FALLBACK}
+                    </canvas>
+                </td>
+                <td style="text-align: center">
+                    <table class="stats" algin="center">
+                        <thead>
+                            <tr>
+                                <th>Month</th>
+                                <th>Nb of distinct IPs</th>
+                                <th>Nb of downloads</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+""")
+        for m, ips, n in rows:
+            h.append(f"""                            <tr>
+                                <td style="text-align: right">{m}/{y}</td>
+                                <td style="text-align: right; background: #aaaaff">{ips}</td>
+                                <td style="text-align: right; background: #ddddff">{n}</td>
+                            </tr>
+""")
+        h.append(f"""                        </tbody>
+                    </table>
+                    <a href="{prefix}_{y}_stats.tab">{prefix}_{y}_stats.tab</a>
+                </td>
+            </tr>
+        </table>
+""")
+    data = {str(y): [{"downloads": n, "month": m, "unique_ips": ips, "year": y} for m, ips, n in rows]
+            for y, rows in sorted(blocks.items())}
+    h.append(f"""
+    <p style="text-align: center">
+        All years in one file:&nbsp;<a href="{prefix}_stats.tab">{prefix}_stats.tab</a>
+    </p>
+    <script src="{CHARTJS}"></script>
+    <script type="text/javascript">
+        var data_table = {json.dumps(data)};
+    </script>
+    <script type="module" src="/packages/stats/static/barchart.js"></script>
+</body>
+
+</html>
+""")
+    return "".join(h)
+
+
+def listing_page(cat, scores, as_of):
+    """index.html / data-annotation.html / ...: the top packages, then every package by letter."""
+    page, kind, _ = KIND[cat]
+    prefix = CATEGORIES[cat][0]
+    nav = "".join(f'<I><A HREF="{KIND[c][0]}">Bioconductor {KIND[c][1]} packages</A></I>&nbsp;&nbsp;&nbsp;&nbsp;\n                '
+                  for c in CATEGORIES if c != cat)
+    title = f"Download stats for Bioconductor {kind} packages"
+    h = [f"""<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<HTML>
+
+<HEAD>
+    <TITLE>{title}</TITLE>
+    <style>
+{CSS_LISTING}    </style>
+</HEAD>
+
+<BODY>
+    <TABLE style="width: 100%; border-spacing: 0px; border-collapse: collapse;">
+        <TR>
+            <TD style="padding: 0px; text-align: right;">
+                <I>See download stats for:</I>&nbsp;&nbsp;&nbsp;&nbsp;
+                {nav}
+            </TD>
+        </TR>
+    </TABLE>
+    <H1 style="text-align: center;">{title}</H1>
+    <p>  </p>
+    <P style="text-align: center;">
+        <I>Data as of {as_of}.</I>
+    </P>
+    <P>The number reported next to each package name is the <I>download score</I>, that is, the average number of
+        distinct IPs that "hit" the package each month for the last 12 months (not counting the current month).</P>
+"""]
+    top = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0].lower(), kv[0]))[:TOP.get(cat, 0)]
+    if top:
+        rows = -(-len(top) // 3)
+        h.append(f"""    <HR>
+    <H2>Top {TOP[cat]}</H2>
+    <table class="pkg_index">
+        <tbody>
+            <tr>
+                <td style="vertical-align: top; width:300px;">
+""")
+        for r in range(rows):
+            h.append('                <tr class="pkg_index">\n')
+            for rank in range(r, len(top), rows):
+                p, score = top[rank]
+                h.append(f"""                         <td
+                            style="width:25px; text-align: right">{rank + 1}</td>
+                        <td>
+                            <a href="{cat}/{p}/">
+                                {p}&nbsp;({score})
+                            </a>
+                        </td>
+""")
+            h.append("                    </tr>\n")
+        h.append("                </td>\n            </tr>\n                </td>\n            </tr>\n        </tbody>\n    </table>\n")
+    if top:   # workflows has no Top N, and master's page has no "All" heading either
+        h.append(f"    <hr>\n    <h2>All {kind} packages</h2>\n")
+    h.append(f"""    <p>
+        All {kind} package stats in one file:&nbsp;
+        <a href="{cat}/{prefix}_pkg_stats.tab">{prefix}_pkg_stats.tab</a>
+    </p>
+    <p>
+        All {kind} download scores in one file:&nbsp;
+        <a href="{cat}/{prefix}_pkg_scores.tab">{prefix}_pkg_scores.tab</a>
+    </p>
+    <p style="text-align: center">
+        <a href="{cat}/index.html">
+            See Download stats for Bioconductor {kind} repository (all packages combined)
+        </a>
+    </p>
+""")
+    letters = {}
+    for p in sorted(scores, key=lambda p: (p.lower(), p)):
+        letters.setdefault(p[0].upper(), []).append(p)
+    for L, pkgs in letters.items():
+        k = -(-len(pkgs) // 3)
+        h.append(f'    <h3 style="font-family: monospace; font-size: larger;">{L}</h3>\n    <div class="column-container">\n')
+        for c in range(3):
+            h.append('        <div class="column">\n')
+            h += [f'            <p>\n                <a href="{cat}/{p}/">{p}&nbsp;({scores[p]})</a>\n            </p>\n'
+                  for p in pkgs[c * k:(c + 1) * k]]
+            h.append("        </div>\n")
+        h.append("    </div>\n")
+    h.append("</BODY>\n</HTML>\n")
+    return "".join(h)
+
+
+@functools.lru_cache(maxsize=None)
+def listed_in(idx, v, cat):
+    f = idx / f"{v}-{cat}.txt"
+    return frozenset(f.read_text().split()) if f.exists() else frozenset()
+
+
+def package_notice(cat, pkg, idx):
+    """Release/devel links, or master's "not in the current release" line, from the cached PACKAGES indexes."""
+    path = CATEGORIES[cat][1]
+    link = lambda v: f'<a href="/packages/{v}/{path}/html/{pkg}.html">{v} version</a>'
+    if idx:
+        vs = sorted({f.name.split("-", 1)[0] for f in idx.glob("*-bioc.txt")}, key=lambda v: tuple(map(int, v.split("."))))
+        listed = [v for v in vs if pkg in listed_in(idx, v, cat)]
+        if len(vs) > 1 and vs[-2] not in listed:   # vs[-1] is devel, vs[-2] the current release
+            return (f"Package {pkg} is not in the current release of Bioconductor. It was last seen in {listed[-1]}."
+                    if listed else "")
+    return f"<b>{pkg}</b> home page:\n            {link('release')},\n            {link('devel')}."
+
+
+def write_pages(tree, idx=None, dest=None):
+    """The stage 4 pages, from the .tab files of `tree`, into `dest` (default: tree). idx: packages-index/."""
+    dest = dest or tree
+    as_of = dt.date.fromisoformat((tree / "DATA_AS_OF").read_text().strip())
+    as_of_text = f"{as_of:%a}. {as_of.day} {as_of:%b %Y}"   # "Thu. 15 Oct 2026"
+    t0, n = time.time(), 0
+
+    def put(path, text):
+        nonlocal n
+        path = dest / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        n += 1
+
+    for cat, (prefix, _) in CATEGORIES.items():
+        page, kind, _k = KIND[cat]
+        scores = {r[0]: int(r[1]) for r in read_tab(tree / cat / f"{prefix}_pkg_scores.tab")}
+        put(page, listing_page(cat, scores, as_of_text))
+        back = (f"/packages/stats/{page}", f"Download stats for Bioconductor {kind} packages")
+        put(f"{cat}/index.html", stats_page(f"Download stats for Bioconductor {kind} repository (all packages combined)",
+                                            back, "", year_blocks(tree / cat / f"{cat}_stats.tab"), cat, as_of_text))
+        for d in sorted(p for p in (tree / cat).iterdir() if p.is_dir()):
+            notice = package_notice(cat, d.name, idx)
+            intro = f'<p style="text-align: center">\n        {notice}\n    </p>' if notice else ""
+            put(f"{cat}/{d.name}/index.html", stats_page(f"Download stats for {'software' if cat == 'bioc' else kind} package {d.name}",
+                                                          back, intro, year_blocks(d / f"{d.name}_stats.tab"), d.name, as_of_text))
+    # ponytail: the listing pages are rewritten whole each run; incremental only if the tree outgrows seconds.
+    put("static/barchart.js", (HERE / "static" / "barchart.js").read_text())
+    print(f"  pages: {n:,d} files, data as of {as_of}  {time.time() - t0:.0f}s", flush=True)
 
 
 def run(out, rebuild_all, salt, published):
@@ -461,7 +753,33 @@ def self_check():
         assert (s.parent / "data-annotation" / "data-annotation_stats.tab").read_text().split("\n")[-1] == "2019\tall\t0\t0", \
             "each category back to its own first year"
         assert (s / "bioc_2019_stats.tab").read_text().split("\n")[-2:] == ["2019\tDec\t9\t20", "2019\tall\t8\t20"]
-    print("self-check OK (downloads view = DOWNLOADS_SQL filter; aggregates; published history; stats tree format)")
+
+        # Stage 4: write_stats wrote the pages before its swap. limma has 2026, 2025 and 2019 (published) blocks.
+        t = out / "stats"
+        assert not (out / "stats.partial").exists() and (t / "index.html").exists(), "pages swapped in with the tree"
+        assert (t / "static" / "barchart.js").read_bytes() == (HERE / "static" / "barchart.js").read_bytes()
+        page = (s / "limma" / "index.html").read_text()
+        assert re.findall(r'<canvas id="(barchart_\d+)" class="barchart" width="720" height="400">', page) == \
+            ["barchart_2026", "barchart_2025", "barchart_2019"], "one canvas per year with data"
+        assert page.count("<td style=\"text-align: right\">") == 3 * 13 and "<td style=\"text-align: right\">Feb/2026</td>" in page
+        assert re.search(r"<td [^>]*#aaaaff[^>]*>\s*2\s*</td>\s*<td [^>]*#ddddff[^>]*>\s*3\s*</td>", page), "Feb 2026: 2 IPs, 3 downloads"
+        assert f"<i>Data as of {dt.date(2026, 2, 20):%a}. 20 Feb 2026</i>" in page, "the DATA_AS_OF line"
+        assert re.findall(r'href="([^"/]+\.tab)"', page) == ["limma_2026_stats.tab", "limma_2025_stats.tab",
+                                                              "limma_2019_stats.tab", "limma_stats.tab"]
+        assert all((s / "limma" / f).exists() for f in re.findall(r'href="([^"/]+\.tab)"', page)), "relative links resolve"
+        assert f'<script src="{CHARTJS}"></script>' in page and "@" in CHARTJS and \
+            '<script type="module" src="/packages/stats/static/barchart.js"></script>' in page
+        assert '"2019": [{"downloads": 0, "month": "Jan", "unique_ips": 0, "year": 2019}' in page
+        assert (t / "bioc" / "index.html").exists() and (t / "data-annotation" / "org.Hs.eg.db" / "index.html").exists()
+        assert not (t / "workflows" / "limma").exists() and (t / "workflows" / "index.html").exists()
+        top = (t / "index.html").read_text()
+        assert 'HREF="data-annotation.html"' in top and 'HREF="index.html"' not in top   # the nav lists the others
+        pop = listing_page("data-annotation", {"b": 5, "A": 9, "c": 5, "d": 1}, "x")   # a populated listing
+        assert 'HREF="index.html"' in pop and "Top 30" in pop and pop.index(">A&nbsp;(9)") < pop.index(">b&nbsp;(5)") < pop.index(">c&nbsp;(5)")
+        assert pop.count('<div class="column">') == 3 * 4 and 'href="data-annotation/A/"' in pop
+        assert "<h2>All workflow packages</h2>" not in (t / "workflows.html").read_text()
+        assert ">Back to the" in (t / "data-annotation" / "index.html").read_text()
+    print("self-check OK (downloads view = DOWNLOADS_SQL filter; aggregates; published history; stats tree format; pages)")
 
 
 def main():
