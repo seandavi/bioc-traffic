@@ -458,7 +458,7 @@ def self_check():
             *(f"2019\t{m}\t0\t0" for m in MONTHS[:10]), "2019\tNov\t0\t0", "2019\tDec\t5\t7", "2019\tall\t6\t12"], lines
         assert (s / "limma" / "limma_2019_stats.tab").exists() and (s / "gone" / "gone_2010_stats.tab").exists()
         assert (s / "bioc_stats.tab").read_text().split("\n")[-1] == "2010\tall\t0\t0", "category years run back to the first"
-        assert (s.parent / "data-annotation" / "annotation_stats.tab").read_text().split("\n")[-1] == "2019\tall\t0\t0", \
+        assert (s.parent / "data-annotation" / "data-annotation_stats.tab").read_text().split("\n")[-1] == "2019\tall\t0\t0", \
             "each category back to its own first year"
         assert (s / "bioc_2019_stats.tab").read_text().split("\n")[-2:] == ["2019\tDec\t9\t20", "2019\tall\t8\t20"]
     print("self-check OK (downloads view = DOWNLOADS_SQL filter; aggregates; published history; stats tree format)")
