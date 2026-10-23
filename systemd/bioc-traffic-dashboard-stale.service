@@ -1,0 +1,12 @@
+[Unit]
+Description=Alert if the published traffic.json is older than its stale_after_hours (dead-man, bioc-traffic#6)
+After=network-online.target
+Wants=network-online.target
+OnFailure=bioc-notify@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
+Environment=PATH=/home/davsean/.local/bin:/usr/bin:/bin
+# Reads the public URL, so it also catches a failed upload or a Worker that stopped serving it.
+ExecStart=/home/davsean/.local/bin/just traffic-check-stale
