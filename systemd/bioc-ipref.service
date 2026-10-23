@@ -1,0 +1,12 @@
+[Unit]
+Description=DB-IP Lite ASN + country release and crawler IP ranges -> Parquet (bioc-traffic#4)
+After=network-online.target
+Wants=network-online.target
+OnFailure=bioc-notify@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
+ExecStart=/home/davsean/.local/bin/uv run --script /home/davsean/Documents/git/bioc-traffic/ipref.py
+# ~12 MB from DB-IP and ~10 s to build, measured 2026-10-23; allow for a slow network.
+TimeoutStartSec=30min

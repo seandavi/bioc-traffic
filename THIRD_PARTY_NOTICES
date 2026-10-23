@@ -1,0 +1,17 @@
+Third-party data used by bioc-traffic
+
+DB-IP Lite: IP to ASN Lite and IP to Country Lite
+  IP Geolocation by DB-IP: https://db-ip.com
+  License: Creative Commons Attribution 4.0 International (CC BY 4.0),
+  https://creativecommons.org/licenses/by/4.0/
+  Releases loaded: monthly, from 2026-09 (2026-09 and 2026-10 as of 2026-10-23). Every
+  derived table carries the release it came from in its dbip_release column.
+  Loaded by ipref.py; used for ASN and country by address (sql/ipref.sql). Anything published
+  with country or ASN derived from it carries the attribution above, with the link.
+
+Crawler IP ranges, as published by their operators (fetched by ipref.py):
+  Google:    https://developers.google.com/static/search/apis/ipranges/
+             (googlebot, special-crawlers, user-triggered-fetchers, user-triggered-fetchers-google)
+  Bing:      https://www.bing.com/toolbox/bingbot.json
+  OpenAI:    https://openai.com/gptbot.json, searchbot.json, chatgpt-user.json
+  Anthropic: https://claude.com/crawling/bots.json

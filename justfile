@@ -30,13 +30,13 @@ reseal:
 backfill to:
     {{script}} --from 2026-08-06 --to {{to}} --upload
 
-# DuckDB with sql/{access,client_class,downloads}.sql loaded, salt set: just duckdb [-c "SELECT ..."]
+# DuckDB with sql/{access,client_class,downloads,ipref}.sql loaded, salt set: just duckdb [-c "SELECT ..."]
 # The salt goes through the environment, not argv or disk; $(...) trims its newline.
 [positional-arguments]
 duckdb *args:
     @BIOC_IP_SALT="$(gcloud secrets versions access latest --secret bioc-logs-ip-salt --project cdsci-infra)" \
       duckdb -init sql/access.sql -cmd "SET VARIABLE ip_salt = getenv('BIOC_IP_SALT')" \
-        -cmd ".read sql/client_class.sql" -cmd ".read sql/downloads.sql" "$@"
+        -cmd ".read sql/client_class.sql" -cmd ".read sql/downloads.sql" -cmd ".read sql/ipref.sql" "$@"
 
 # Package download stats (#11): stale monthly partitions, aggregates (with the published
 # months before 2020 from published_month.parquet, #24), the /packages/stats/ tree
@@ -200,3 +200,20 @@ published-compare:
 # published-stats-mirror.py checks: link discovery, path canonicalisation
 published-self-check:
     ./published-stats-mirror.py --self-check
+
+# ASN and country by address, both eras (#4): DB-IP Lite's release (default this month's, kept
+# beside the earlier ones) and the Google, Bing, OpenAI, Anthropic crawler ranges, to
+# /data/davsean/bioc-traffic-ipref. Queried through sql/ipref.sql.
+# Land a DB-IP Lite release and today's crawler ranges: just ipref [--release YYYY-MM]
+ipref *args:
+    ./ipref.py {{args}}
+
+# ipref.py checks: ip_num = Python's ipaddress, a merged release = a brute-force lookup
+ipref-self-check:
+    ./ipref.py --self-check
+
+# No salt needed: it reads cloudflare_access, not client_id.
+# DB-IP vs cf_asn / cf_country, one Cloudflare-era UTC day: just ipref-agreement 2026-10-22
+ipref-agreement day:
+    duckdb -init sql/access.sql -cmd ".read sql/ipref.sql" -c "SET VARIABLE day = DATE '{{day}}'" \
+      -c ".read sql/ipref_agreement.sql" < /dev/null
