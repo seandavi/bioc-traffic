@@ -1,0 +1,11 @@
+[Unit]
+Description=Monthly DB-IP Lite release and crawler IP ranges
+
+[Timer]
+# A few days into the month, for DB-IP's new release. If it is not out yet, ipref.py falls
+# back to last month's (already landed, so only the crawler ranges are new).
+OnCalendar=*-*-03 06:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

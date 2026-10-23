@@ -48,6 +48,13 @@ The logs contain client IP addresses, and they never leave this pipeline. Distin
 counted with a salted hash, and only aggregates are published. No log data is in this
 repository.
 
+## Third-party data
+
+ASN and country by address, for the CloudFront years that logged only the address:
+<a href='https://db-ip.com'>IP Geolocation by DB-IP</a>, CC BY 4.0, a monthly release from
+2026-09 on. Plus the IP ranges Google, Bing, OpenAI and Anthropic publish for their crawlers.
+Details in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+
 ## Related
 
 - [bioc-edge](https://github.com/seandavi/bioc-edge): the Cloudflare Worker that serves
