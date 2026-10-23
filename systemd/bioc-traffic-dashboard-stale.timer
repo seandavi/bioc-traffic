@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily dead-man check on the public traffic dashboard
+
+[Timer]
+# Hours after the 11:45 UTC run; with the 48 h threshold, two missed runs trip it.
+OnCalendar=*-*-* 18:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -54,7 +54,7 @@ CREATE OR REPLACE MACRO package_download_v0(uri, status, method) AS
 
 -- Production requests with every rollup dimension derived.
 CREATE OR REPLACE VIEW hits AS
-SELECT ts, year, date,
+SELECT ts, year, date, era,
        -- ponytail: a 64-bit hash of client_id for count(DISTINCT); collisions ~n²/2^65, nil
        -- at millions of clients.
        hash(client_id) AS client_key,

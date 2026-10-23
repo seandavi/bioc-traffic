@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<!-- The public traffic dashboard (seandavi/bioc-traffic#6), served at /packages/stats/traffic/.
+     Static: everything comes from ../static/traffic.json, which `just traffic` writes daily. -->
+<head>
+    <meta charset="utf-8">
+    <title>bioconductor.org traffic</title>
+    <style>
+        body { font-family: sans-serif; font-size: 10pt; max-width: 1100px; margin: 0 auto; padding: 0 1em; }
+        h1 { font-size: 16pt; }
+        h2 { font-size: 14pt; margin-top: 1.5em; }
+        .stale { background: #fdd; border: 1px solid #c00; padding: 0.5em; }
+        .chart { height: 320px; }
+        table { border-collapse: collapse; }
+        td, th { padding: 2px 8px; text-align: left; }
+        td.n, th.n { text-align: right; }
+        tbody tr:nth-child(odd) { background: #eef; }
+    </style>
+</head>
+
+<body>
+    <p><i><a href="/packages/stats/">Package download stats</a></i></p>
+    <h1>bioconductor.org traffic</h1>
+    <p id="stamp">Loading…</p>
+    <p id="stale" class="stale" hidden></p>
+
+    <p>Every request to bioconductor.org gets a traffic class from rule-based, versioned
+        <a href="https://github.com/seandavi/bioc-traffic/blob/main/sql/client_class.sql">rules</a>
+        (browser, R and other package clients, crawlers, mirrors, CI, monitoring, likely automated).
+        Counts are per UTC day. A client is one network address, counted through a salted hash;
+        no addresses are published. The dashed line marks the site's move from CloudFront to
+        Cloudflare: from there the rules also see network (ASN) and verified-bot labels, so class
+        totals step at that line by design. They are not smoothed.</p>
+    <p>
+        Show:
+        <button data-days="90">90 days</button>
+        <button data-days="365">1 year</button>
+        <button data-days="0">all (since 2020)</button>
+    </p>
+
+    <h2>Web usage</h2>
+    <p>Every request that is not a package download: pages, documentation, build reports, and the
+        package indexes R itself reads.</p>
+    <h3>Requests per day</h3>
+    <div class="chart"><canvas id="web-requests"></canvas></div>
+    <h3>Distinct clients per day</h3>
+    <div class="chart"><canvas id="web-clients"></canvas></div>
+
+    <h2>Package usage</h2>
+    <p>Package downloads (source and binary tarballs) on the definition the
+        <a href="/packages/stats/">download stats</a> use. R and BiocManager installs are
+        <i>package client</i>.</p>
+    <h3>Downloads per day</h3>
+    <div class="chart"><canvas id="package-requests"></canvas></div>
+    <h3>Distinct clients per day</h3>
+    <div class="chart"><canvas id="package-clients"></canvas></div>
+
+    <h2>Top pages, browsers</h2>
+    <p id="top-window"></p>
+    <table>
+        <thead><tr><th class="n">#</th><th>Page</th><th class="n">Views</th><th class="n">Distinct clients</th></tr></thead>
+        <tbody id="top-pages"></tbody>
+    </table>
+
+    <p><small>Data: <a href="../static/traffic.json">traffic.json</a> (field meanings in its
+        <code>note</code>). Source and method:
+        <a href="https://github.com/seandavi/bioc-traffic">seandavi/bioc-traffic</a>.
+        On the cutover day the two eras are added together, so that day's distinct clients may
+        count someone twice.</small></p>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1"></script>
+    <script>
+        // Fixed colours, so a class keeps its colour across charts; null client_class is the total.
+        const CLASSES = {
+            "null": ["all classes", "#444"], human_browser: ["browser", "#1f77b4"],
+            package_client: ["package client (R)", "#2ca02c"], search_crawler: ["search crawler", "#ff7f0e"],
+            ai_crawler: ["AI crawler", "#d62728"], likely_automated: ["likely automated", "#9467bd"],
+            mirror: ["mirror", "#8c564b"], ci: ["CI", "#e377c2"], monitoring: ["monitoring", "#bcbd22"],
+            unknown: ["unknown", "#7f7f7f"],
+        };
+        const DAY = 86400000;
+        const iso = (t) => new Date(t).toISOString().slice(0, 10);
+        const charts = [];
+
+        // The era boundary as a dashed vertical line, at its label.
+        const boundary = {
+            id: "boundary",
+            afterDatasetsDraw(chart, _, opts) {
+                const i = chart.data.labels.indexOf(opts.day);
+                if (i < 0) return;
+                const x = chart.scales.x.getPixelForValue(i), { top, bottom } = chart.chartArea, c = chart.ctx;
+                c.save(); c.setLineDash([4, 4]); c.strokeStyle = "#000";
+                c.beginPath(); c.moveTo(x, top); c.lineTo(x, bottom); c.stroke();
+                // Left of the line: the boundary sits near the right edge in every range.
+                c.textAlign = "right"; c.fillText("CloudFront → Cloudflare ", x, top + 10); c.restore();
+            },
+        };
+
+        // {client_class: {day: value}}, eras added together (they overlap only around the cutover).
+        function byClass(data, surface, metric) {
+            const out = {};
+            for (const s of data.series.filter((s) => s.surface === surface)) {
+                const m = (out[String(s.client_class)] ??= {}), t0 = Date.parse(s.start);
+                s[metric].forEach((v, i) => {
+                    const d = iso(t0 + i * DAY);
+                    if (v !== null) m[d] = (m[d] ?? 0) + v;
+                    else if (!(d in m)) m[d] = null;
+                });
+            }
+            return out;
+        }
+
+        function draw(data, days) {
+            charts.splice(0).forEach((c) => c.destroy());
+            const last = Date.parse(data.data_through);
+            const first = days ? last - (days - 1) * DAY
+                : Math.min(...data.series.map((s) => Date.parse(s.start)));
+            const labels = [];
+            for (let t = first; t <= last; t += DAY) labels.push(iso(t));
+            for (const [surface, metric] of [["web", "requests"], ["web", "clients"], ["package", "requests"], ["package", "clients"]]) {
+                const series = byClass(data, surface, metric);
+                const datasets = Object.keys(CLASSES).filter((k) => k in series).map((k) => ({
+                    label: CLASSES[k][0], borderColor: CLASSES[k][1], backgroundColor: CLASSES[k][1],
+                    borderWidth: k === "null" ? 2 : 1, pointRadius: 0, spanGaps: false,
+                    data: labels.map((d) => series[k][d] ?? null),
+                }));
+                charts.push(new Chart(document.getElementById(`${surface}-${metric}`), {
+                    type: "line", data: { labels, datasets }, plugins: [boundary],
+                    options: {
+                        animation: false, maintainAspectRatio: false, interaction: { mode: "index", intersect: false },
+                        scales: { y: { beginAtZero: true } },
+                        plugins: { boundary: { day: data.era_boundary } },
+                    },
+                }));
+            }
+        }
+
+        fetch("../static/traffic.json").then((r) => {
+            if (!r.ok) throw new Error(`traffic.json: HTTP ${r.status}`);
+            return r.json();
+        }).then((data) => {
+            const age = (Date.now() - Date.parse(data.generated_at)) / 3600000;
+            document.getElementById("stamp").textContent =
+                `Data through ${data.data_through} (UTC), generated ${data.generated_at}, classification rules ${data.rule_version}.`;
+            if (age > data.stale_after_hours) {
+                const s = document.getElementById("stale");
+                s.textContent = `These numbers are ${Math.floor(age / 24)} days old: the daily update has stopped. They are shown as last generated.`;
+                s.hidden = false;
+            }
+            const tp = data.top_pages;
+            document.getElementById("top-window").textContent =
+                `Page views by browsers, ${tp.start} to ${tp.end}. Pages reached by fewer than 10 distinct clients are left out.`;
+            document.getElementById("top-pages").replaceChildren(...tp.rows.map((r, i) => {
+                const tr = document.createElement("tr");
+                for (const [v, cls] of [[i + 1, "n"], [r.page, ""], [r.requests.toLocaleString(), "n"], [r.clients.toLocaleString(), "n"]]) {
+                    const td = document.createElement("td");
+                    td.textContent = v; td.className = cls;   // textContent: paths come from requests
+                    tr.append(td);
+                }
+                return tr;
+            }));
+            document.querySelectorAll("button[data-days]").forEach((b) =>
+                b.addEventListener("click", () => draw(data, Number(b.dataset.days))));
+            draw(data, 365);
+        }).catch((e) => { document.getElementById("stamp").textContent = `Could not load the traffic data (${e.message}).`; });
+    </script>
+</body>
+
+</html>

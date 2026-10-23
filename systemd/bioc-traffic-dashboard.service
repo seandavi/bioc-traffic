@@ -1,0 +1,20 @@
+[Unit]
+Description=Public traffic dashboard: daily series, top pages -> traffic.json + page, then R2 (bioc-traffic#6)
+After=network-online.target
+Wants=network-online.target
+OnFailure=bioc-notify@%N.service
+
+[Service]
+# DuckDB opens every Parquet file in the glob; the user-manager default soft limit is 1024 (1653 files by 2026-10-13)
+LimitNOFILE=65536
+Type=oneshot
+WorkingDirectory=/home/davsean/Documents/git/bioc-traffic
+# just, duckdb, gcloud, rclone
+Environment=PATH=/home/davsean/.local/bin:/usr/bin:/bin
+ExecStart=/home/davsean/.local/bin/just traffic
+# Then the page and its JSON, which the Worker serves from R2. A failed upload fails the unit.
+ExecStart=/home/davsean/.local/bin/just traffic-upload
+# Incremental: ~1 min (last 3 days + a 30 d top-pages scan). A rule version bump makes the
+# run a full backfill from 2020 (~45 min), hence the margin.
+TimeoutStartSec=2h
+Nice=10
