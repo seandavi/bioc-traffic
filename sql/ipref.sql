@@ -13,6 +13,8 @@
 --                           date ('2026-10-23'; '*' for every fetch): fetched, operator, list,
 --                           creation_time, prefix, ip_version, ip_first, ip_last. CIDRs, so
 --                           match with BETWEEN ip_first AND ip_last (lists can overlap)
+--   crawler_fetch_for(d)    the fetch in effect on date d, as dbip_release_for: the latest at or
+--                           before d, else the earliest
 --
 -- Lookup, either era:
 --   SELECT a.c_ip, r.asn, r.as_org, r.country
@@ -64,6 +66,11 @@ CREATE OR REPLACE MACRO dbip_release_for(d) AS (
     SELECT coalesce(max(r) FILTER (WHERE r <= strftime(CAST(d AS DATE), '%Y-%m')), min(r))
     FROM (SELECT regexp_extract(file, 'dbip-([0-9]{4}-[0-9]{2})\.parquet$', 1) AS r
           FROM glob(ipref_root() || '/dbip/dbip-*.parquet')));
+
+CREATE OR REPLACE MACRO crawler_fetch_for(d) AS (
+    SELECT coalesce(max(f) FILTER (WHERE f <= strftime(CAST(d AS DATE), '%Y-%m-%d')), min(f))
+    FROM (SELECT regexp_extract(file, 'crawlers-([0-9]{4}-[0-9]{2}-[0-9]{2})\.parquet$', 1) AS f
+          FROM glob(ipref_root() || '/crawlers/crawlers-*.parquet')));
 
 CREATE OR REPLACE MACRO crawler_ranges(date) AS TABLE
 SELECT fetched, operator, list, creation_time, prefix, ip_version,

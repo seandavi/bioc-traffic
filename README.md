@@ -28,8 +28,11 @@ Some of what it turns up:
 - **New ones show up.** A crawler fetching from Google Cloud now makes about a million
   requests a day, mostly build-report pages.
 
-The classifier is at v0 and the rules are in plain SQL (`sql/client_class.sql`). Every
-number it produces carries its rule version, so history recomputes when the rules improve.
+The numbers above and below come from classifier v0; the rules are in plain SQL
+(`sql/client_class.sql`). v1 (`sql/client_class_v1.sql`) adds ASN for both eras, the crawlers'
+published address ranges and per-day behaviour by address and /24; the stats and rollups have
+not switched to it yet. Every number carries its rule version, so history recomputes when the
+rules improve.
 
 ## What it produces
 
