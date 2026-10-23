@@ -160,3 +160,23 @@ CREATE OR REPLACE MACRO client_class_v0(ua, uri, method,
     client_class_v0_(client_ua_v0(ua), uri, method, bot_category, asn);
 
 CREATE OR REPLACE MACRO is_human_v0(client_class) AS client_class = 'human_browser';
+
+-- The UTC days d0..d1, written so the Hive partitions prune: plain comparisons on year and
+-- month (an expression over them prunes nothing), month only within one year.
+CREATE OR REPLACE MACRO access_in_days_(year, month, date, d0, d1) AS
+    year BETWEEN year(CAST(d0 AS DATE)) AND year(CAST(d1 AS DATE))
+    AND month BETWEEN CASE WHEN year(CAST(d0 AS DATE)) = year(CAST(d1 AS DATE))
+                           THEN month(CAST(d0 AS DATE)) ELSE 1 END
+                  AND CASE WHEN year(CAST(d0 AS DATE)) = year(CAST(d1 AS DATE))
+                           THEN month(CAST(d1 AS DATE)) ELSE 12 END
+    AND date BETWEEN CAST(d0 AS DATE) AND CAST(d1 AS DATE);
+
+-- Every row of src in the UTC days d0..d1, plus client_class and rule_version: the same
+-- interface as classified_access_v1 (sql/client_class_v1.sql), so a consumer switches
+-- versions by changing the name. src needs access's columns.
+CREATE OR REPLACE MACRO classified_access_v0(d0, d1, src := 'access') AS TABLE
+SELECT *, client_class_v0(cs_user_agent, cs_uri_stem, cs_method,
+                          bot_category := bot_category, asn := cf_asn) AS client_class,
+       'v0' AS rule_version
+FROM query_table(src)
+WHERE access_in_days_(year, month, date, d0, d1);
